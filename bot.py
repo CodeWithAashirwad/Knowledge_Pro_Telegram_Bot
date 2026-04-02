@@ -749,7 +749,7 @@ class _PingHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
         self.end_headers()
-        self.wfile.write("Knowledge Pro AI Bot - alive!".encode('utf-8'))
+        self.wfile.write("Knowledge Pro AI Bot - alive!")
 
 
     def log_message(self, *_):
