@@ -1,3 +1,6 @@
-# Pinned versions — tested stable on Python 3.12–3.14
-python-telegram-bot[job-queue]==21.9
+python-telegram-bot==21.3
 firebase-admin==6.5.0
+yt-dlp==2024.8.6
+flask==3.0.3
+waitress==3.0.0
+requests==2.32.3
