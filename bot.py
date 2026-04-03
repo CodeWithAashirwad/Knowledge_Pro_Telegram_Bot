@@ -1,3 +1,4 @@
+
 """
 Knowledge Pro AI Telegram Bot
 Single file | Firebase REST | HTML parse mode
@@ -719,45 +720,39 @@ async def nuke_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #   players. This is the community-accepted fix for server deployments.
 # =============================================================================
 
-def _yt_opts(fmt, outtmpl):
+def _yt_opts(fmt, outtmpl, clients=None):
     """
     Build yt-dlp options.
-    CRITICAL: do NOT include 'cookiesfrombrowser' key at all -- not even as None.
-    Use tv_embedded + mweb player clients to bypass YouTube bot-detection on servers.
+    CRITICAL: 'cookiesfrombrowser' must NEVER appear as a key in this dict.
+    Even set to None it triggers Chrome profile lookups and crashes on headless servers.
+
+    Client strategy (tried in order):
+      ios         -- bypasses age-restriction on most videos without any cookies
+      tv_embedded -- bypasses bot-detection gate on datacenter IPs (Render etc.)
+      mweb        -- mobile-web fallback
     """
+    if clients is None:
+        clients = ["ios", "tv_embedded", "mweb"]
+
     opts = {
         "outtmpl":     outtmpl,
         "noplaylist":  True,
         "quiet":       True,
         "no_warnings": True,
-
-        # tv_embedded bypasses "sign in to confirm you're not a bot"
-        # Do NOT use: web, android, web_creator -- all blocked on datacenter IPs
         "extractor_args": {
             "youtube": {
-                "player_client": ["tv_embedded", "mweb"],
+                "player_client": clients,
             }
         },
-
         "http_headers": {
             "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/125.0.0.0 Safari/537.36"
+                "com.google.ios.youtube/19.29.1 "
+                "CFNetwork/1568.100.1 Darwin/24.0.0"
             ),
         },
-
-        # Rate-limit mitigation
-        "sleep_interval":          1,
-        "max_sleep_interval":      3,
-        "sleep_interval_requests": 1,
         "retries":          5,
         "fragment_retries": 5,
     }
-
-    # Optional cookies.txt for age-restricted content
-    if YT_COOKIES and os.path.isfile(YT_COOKIES):
-        opts["cookiefile"] = YT_COOKIES
 
     if fmt == "mp4":
         opts["format"] = (
@@ -775,24 +770,7 @@ def _yt_opts(fmt, outtmpl):
     return opts
 
 
-def _yt_friendly_error(raw):
-    msg = raw.lower()
-    if any(k in msg for k in ("sign in", "login required", "age-restrict",
-                               "confirm your age", "age restrict")):
-        return (
-            "This video is age-restricted.\n"
-            "To download it, provide a cookies.txt file via the YT_COOKIES_FILE env var."
-        )
-    if any(k in msg for k in ("private video", "members only")):
-        return "This video is private or members-only."
-    if any(k in msg for k in ("copyright", "not available", "unavailable", "removed", "blocked")):
-        return "This video is unavailable, removed, or blocked in this region."
-    if any(k in msg for k in ("confirm you", "bot", "verify")):
-        return "YouTube is requesting bot verification. Please try again in a few minutes."
-    return raw.split("\n")[0][:300]
-
-
-async def cmd_yt_dow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_yt_dow(update, context):
     if len(context.args) < 2:
         return await update.message.reply_text(
             "Usage: /yt_dow url mp4|mp3\n\n"
@@ -804,53 +782,97 @@ async def cmd_yt_dow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fmt = context.args[1].lower()
     if fmt not in ("mp4", "mp3"):
         return await update.message.reply_text(
-            "Format must be <code>mp4</code> or <code>mp3</code>.", parse_mode=ParseMode.HTML
+            "Format must be <code>mp4</code> or <code>mp3</code>.",
+            parse_mode=ParseMode.HTML
         )
 
-    status = await update.message.reply_text("Downloading, please wait...")
+    status = await update.message.reply_text("\u23f3 Downloading, please wait...")
+
+    # Try multiple client strategies -- stops at first success
+    strategies = [
+        ["ios"],                         # best: bypasses age-restriction, no cookies
+        ["tv_embedded"],                 # good: bypasses bot-detection on server IPs
+        ["mweb"],                        # mobile web fallback
+        ["ios", "tv_embedded", "mweb"],  # all combined last resort
+    ]
+    last_err = None
 
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
             outtmpl = os.path.join(tmpdir, "%(title)s.%(ext)s")
-            opts    = _yt_opts(fmt, outtmpl)
 
-            try:
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    info  = ydl.extract_info(url, download=True)
-                    title = info.get("title", "video")
-            except yt_dlp.utils.DownloadError as dl_err:
-                friendly = _yt_friendly_error(str(dl_err))
+            info  = None
+            title = "video"
+
+            for clients in strategies:
+                try:
+                    opts = _yt_opts(fmt, outtmpl, clients=clients)
+                    with yt_dlp.YoutubeDL(opts) as ydl:
+                        info  = ydl.extract_info(url, download=True)
+                        title = info.get("title", "video")
+                    last_err = None
+                    break  # success
+                except yt_dlp.utils.DownloadError as e:
+                    last_err = str(e)
+                    low = last_err.lower()
+                    # Do not retry on permanent failures
+                    if any(k in low for k in ("private", "members only",
+                                              "copyright", "not available",
+                                              "unavailable", "removed", "blocked")):
+                        break
+                    logger.warning(f"yt_dow client={clients} failed, trying next")
+                    continue
+
+            if last_err is not None:
+                low = last_err.lower()
+                if any(k in low for k in ("private", "members only")):
+                    msg = "This video is <b>private or members-only</b>."
+                elif any(k in low for k in ("copyright", "not available",
+                                             "unavailable", "removed", "blocked")):
+                    msg = "This video is <b>unavailable</b>, removed, or blocked in this region."
+                elif any(k in low for k in ("age", "sign in", "login")):
+                    msg = (
+                        "This video has <b>strict age-restriction</b> that cannot be bypassed "
+                        "without a signed-in account. Most age-restricted videos work fine; "
+                        "this one has extra account-level protection."
+                    )
+                else:
+                    first_line = last_err.split("\n")[0][:250]
+                    msg = f"YouTube error: {esc(first_line)}"
                 return await status.edit_text(
-                    f"<b>Download failed</b>\n\n{esc(friendly)}", parse_mode=ParseMode.HTML
+                    f"\u274c <b>Download failed</b>\n\n{msg}",
+                    parse_mode=ParseMode.HTML
                 )
 
             files = os.listdir(tmpdir)
             if not files:
-                return await status.edit_text("Download produced no file. Try a different URL.")
+                return await status.edit_text("\u274c Download produced no file. Try a different URL.")
 
             filepath = os.path.join(tmpdir, files[0])
             size_mb  = os.path.getsize(filepath) / (1024 * 1024)
             if size_mb > 50:
                 return await status.edit_text(
-                    f"File is {size_mb:.1f} MB -- Telegram limit is 50 MB.\n"
-                    "Try mp3 format instead."
+                    f"\u274c File is {size_mb:.1f} MB — Telegram limit is 50 MB.\n"
+                    "Try <code>mp3</code> format instead.",
+                    parse_mode=ParseMode.HTML
                 )
 
             await status.edit_text(
-                f"Uploading <b>{esc(title)}</b> ({size_mb:.1f} MB)...",
+                f"\U0001f4e4 Uploading <b>{esc(title)}</b> ({size_mb:.1f} MB)...",
                 parse_mode=ParseMode.HTML
             )
             with open(filepath, "rb") as f:
                 if fmt == "mp4":
-                    await update.message.reply_video(video=f, caption=f"Video: {title}")
+                    await update.message.reply_video(video=f, caption=f"\U0001f3ac {title}")
                 else:
-                    await update.message.reply_audio(audio=f, title=title, caption=f"Audio: {title}")
+                    await update.message.reply_audio(audio=f, title=title, caption=f"\U0001f3b5 {title}")
             await status.delete()
 
     except Exception as e:
-        logger.error(f"yt_dow error: {e}")
+        logger.error(f"yt_dow unexpected: {e}")
         await status.edit_text(
-            f"<b>Unexpected error</b>\n{esc(str(e)[:300])}", parse_mode=ParseMode.HTML
+            f"\u274c <b>Unexpected error</b>\n{esc(str(e)[:300])}",
+            parse_mode=ParseMode.HTML
         )
 
 
@@ -898,23 +920,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =============================================================================
-# KEEP-ALIVE
+# KEEP-ALIVE  (three-layer 24/7 strategy)
 # =============================================================================
-# Two-part strategy for 24/7 on Render free tier:
 #
-# Part 1 -- Flask server:
-#   Render requires a web service to respond on PORT. The Flask server
-#   handles that. Without it, Render kills the process immediately.
+# Layer 1 — Flask web server (required by Render to keep the service alive)
+#   Render kills any web service that doesn't listen on PORT within 60 s.
 #
-# Part 2 -- Self-ping loop:
-#   Render spins down free services after 15 minutes of NO incoming HTTP
-#   requests. The Flask server alone doesn't help -- it only responds,
-#   it doesn't generate traffic. The self-ping loop sends an HTTP GET to
-#   the service's own public URL every 10 minutes, which counts as traffic
-#   and keeps Render from spinning it down.
+# Layer 2 — Self-ping loop (prevents Render free tier from sleeping)
+#   Render free tier spins down after 15 min of no inbound HTTP traffic.
+#   We ping our own public URL every 10 minutes so Render counts it as active.
+#   Set RENDER_EXTERNAL_URL env var to your service URL, e.g.:
+#       https://knowledge-pro-telegram-bot.onrender.com
 #
-# Set RENDER_EXTERNAL_URL env var in Render dashboard to your service URL
-# e.g. https://my-bot.onrender.com  -- the self-ping will use it.
+# Layer 3 — Telegram error handler + auto-reconnect loop
+#   run_polling() can silently stop if it hits a network error or Telegram
+#   rate-limit. We wrap it in a retry loop with exponential back-off so the
+#   bot automatically recovers instead of going dead.
 # =============================================================================
 
 _flask_app = Flask(__name__)
@@ -930,31 +951,38 @@ def _run_flask():
 
 
 def _self_ping_loop():
-    """Ping own URL every 10 minutes to prevent Render free tier from sleeping."""
+    """Ping own public URL every 10 min to prevent Render free-tier sleep."""
     if not RENDER_URL:
-        logger.info("RENDER_EXTERNAL_URL not set -- self-ping disabled.")
+        logger.info("RENDER_EXTERNAL_URL not set — self-ping disabled.")
         return
     ping_url = RENDER_URL.rstrip("/") + "/"
-    logger.info(f"Self-ping loop started -> {ping_url} every 10 min")
+    logger.info(f"Self-ping started → {ping_url} every 10 min")
     while True:
-        threading.Event().wait(600)  # wait 10 minutes
+        threading.Event().wait(600)          # non-blocking 10-minute wait
         try:
-            r = _req.get(ping_url, timeout=10)
-            logger.info(f"Self-ping OK: {r.status_code}")
+            r = _req.get(ping_url, timeout=15)
+            logger.info(f"Self-ping OK ({r.status_code})")
         except Exception as e:
             logger.warning(f"Self-ping failed: {e}")
 
 
 def start_keep_alive():
-    # Flask server thread
-    threading.Thread(target=_run_flask, daemon=True).start()
+    threading.Thread(target=_run_flask,       daemon=True).start()
+    threading.Thread(target=_self_ping_loop,  daemon=True).start()
     logger.info(f"Keep-alive server on port {PORT}")
-    # Self-ping thread
-    threading.Thread(target=_self_ping_loop, daemon=True).start()
 
 
 # =============================================================================
-# MAIN
+# ERROR HANDLER  — logs errors without crashing the bot
+# =============================================================================
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Log every unhandled exception so it doesn't silently kill polling."""
+    logger.error("Unhandled exception:", exc_info=context.error)
+
+
+# =============================================================================
+# MAIN  — wraps run_polling in a retry loop for true 24/7 operation
 # =============================================================================
 
 def main():
@@ -963,34 +991,60 @@ def main():
 
     start_keep_alive()
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    backoff = 5   # seconds between reconnect attempts, doubles on each failure
 
-    app.add_handler(CommandHandler("start",       cmd_start))
-    app.add_handler(CommandHandler("help",        cmd_help))
-    app.add_handler(CommandHandler("id",          cmd_id))
-    app.add_handler(CommandHandler("roll",        cmd_roll))
-    app.add_handler(CommandHandler("kick",        cmd_kick))
-    app.add_handler(CommandHandler("ban",         cmd_ban))
-    app.add_handler(CommandHandler("mute",        cmd_mute))
-    app.add_handler(CommandHandler("unmute",      cmd_unmute))
-    app.add_handler(CommandHandler("promote",     cmd_promote))
-    app.add_handler(CommandHandler("demote",      cmd_demote))
-    app.add_handler(CommandHandler("permission",  cmd_permission))
-    app.add_handler(CommandHandler("pin",         cmd_pin))
-    app.add_handler(CommandHandler("unpin",       cmd_unpin))
-    app.add_handler(CommandHandler("autoreply",   cmd_autoreply))
-    app.add_handler(CommandHandler("shout",       cmd_shout))
-    app.add_handler(CommandHandler("shoutconfig", cmd_shoutconfig))
-    app.add_handler(CommandHandler("afk",         cmd_afk))
-    app.add_handler(CommandHandler("nuke",        cmd_nuke))
-    app.add_handler(CommandHandler("yt_dow",      cmd_yt_dow))
+    while True:
+        try:
+            app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CallbackQueryHandler(shoutconfig_callback, pattern=r"^shout_"))
-    app.add_handler(CallbackQueryHandler(nuke_callback,        pattern=r"^nuke\|"))
-    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
+            # ── Error handler (prevents silent crashes) ──────────────────────
+            app.add_error_handler(error_handler)
 
-    logger.info("Knowledge Pro AI Bot starting...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+            # ── Command handlers ─────────────────────────────────────────────
+            app.add_handler(CommandHandler("start",       cmd_start))
+            app.add_handler(CommandHandler("help",        cmd_help))
+            app.add_handler(CommandHandler("id",          cmd_id))
+            app.add_handler(CommandHandler("roll",        cmd_roll))
+            app.add_handler(CommandHandler("kick",        cmd_kick))
+            app.add_handler(CommandHandler("ban",         cmd_ban))
+            app.add_handler(CommandHandler("mute",        cmd_mute))
+            app.add_handler(CommandHandler("unmute",      cmd_unmute))
+            app.add_handler(CommandHandler("promote",     cmd_promote))
+            app.add_handler(CommandHandler("demote",      cmd_demote))
+            app.add_handler(CommandHandler("permission",  cmd_permission))
+            app.add_handler(CommandHandler("pin",         cmd_pin))
+            app.add_handler(CommandHandler("unpin",       cmd_unpin))
+            app.add_handler(CommandHandler("autoreply",   cmd_autoreply))
+            app.add_handler(CommandHandler("shout",       cmd_shout))
+            app.add_handler(CommandHandler("shoutconfig", cmd_shoutconfig))
+            app.add_handler(CommandHandler("afk",         cmd_afk))
+            app.add_handler(CommandHandler("nuke",        cmd_nuke))
+            app.add_handler(CommandHandler("yt_dow",      cmd_yt_dow))
+
+            # ── Callback query handlers ──────────────────────────────────────
+            app.add_handler(CallbackQueryHandler(shoutconfig_callback, pattern=r"^shout_"))
+            app.add_handler(CallbackQueryHandler(nuke_callback,        pattern=r"^nuke\|"))
+
+            # ── Message handler ──────────────────────────────────────────────
+            app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
+
+            logger.info("Knowledge Pro AI Bot starting polling...")
+            backoff = 5   # reset backoff on a clean start
+
+            app.run_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=True,
+                # These timeouts give the bot time to recover from transient network issues
+                read_timeout=30,
+                write_timeout=30,
+                connect_timeout=30,
+                pool_timeout=30,
+            )
+
+        except Exception as e:
+            logger.error(f"Polling crashed: {e}. Reconnecting in {backoff}s...")
+            threading.Event().wait(backoff)
+            backoff = min(backoff * 2, 120)   # exponential back-off, max 2 min
 
 
 if __name__ == "__main__":
