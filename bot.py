@@ -1,8 +1,15 @@
 """
 Knowledge Pro AI Telegram Bot
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Single-file | Firebase REST | HTML parse mode (no Markdown entity crashes)
-All posters fetched from Firebase /media/<key> — editable without redeploying
+Single file | Firebase REST | HTML parse mode (no Markdown entity crashes)
+
+ALL POSTERS — editable in Firebase Realtime DB under /media/<key>:
+  media/welcome           → /start  welcome photo/gif
+  media/help              → /help   photo/gif
+  media/autoreply_poster  → /autoreply list header image
+  media/shout_config      → /shoutconfig panel image
+  media/afk_poster        → /afk embed image
+  media/nuke_poster       → /nuke panel image
 """
 
 import os
@@ -22,10 +29,10 @@ from telegram.ext import (
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
 
-# ─── YouTube Download ────────────────────────────────────────────────────────
+# ─── YouTube ─────────────────────────────────────────────────────────────────
 import yt_dlp
 
-# ─── HTTP (Firebase REST) ────────────────────────────────────────────────────
+# ─── Firebase REST ───────────────────────────────────────────────────────────
 import requests as _req
 
 # ─── Keep-Alive ──────────────────────────────────────────────────────────────
@@ -33,27 +40,24 @@ from flask import Flask
 from waitress import serve
 
 # ═════════════════════════════════════════════════════════════════════════════
-# ENVIRONMENT VARIABLES  ← set these in Render / Railway / your host
+# ENV VARIABLES  ← set in Render / Railway / .env
 # ═════════════════════════════════════════════════════════════════════════════
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 BOT_OWNER = int(os.environ.get("BOT_OWNER", "0"))
 PORT      = int(os.environ.get("PORT", "8080"))
 
 # ═════════════════════════════════════════════════════════════════════════════
-# FIREBASE  (Realtime Database — REST, no SDK needed)
+# FIREBASE  (Realtime Database — pure REST, no SDK)
 # ═════════════════════════════════════════════════════════════════════════════
 _FB_BASE = "https://knowledge-pro-c9ee5-default-rtdb.firebaseio.com"
 
-# ─── Logging ─────────────────────────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
-# ═════════════════════════════════════════════════════════════════════════════
-# FIREBASE HELPERS
-# ═════════════════════════════════════════════════════════════════════════════
+# ─── Firebase helpers ─────────────────────────────────────────────────────────
 
 def fb_get(path: str):
     try:
@@ -80,36 +84,59 @@ def fb_delete(path: str):
         return False
 
 # ═════════════════════════════════════════════════════════════════════════════
-# MEDIA HELPER
-# ═════════════════════════════════════════════════════════════════════════════
-# Firebase path: /media/<key>  →  value: "https://..." (direct image/gif URL)
-#
-# Keys used by this bot:
-#   welcome          → /start photo/gif
-#   help             → /help photo/gif
-#   autoreply_poster → /autoreply list header image
-#   shout_config     → /shoutconfig panel image
-#   afk_poster       → /afk embed image
-#   nuke_poster      → /nuke panel image
-# ─────────────────────────────────────────────────────────────────────────────
-
-def get_media(key: str) -> str:
-    """Return the URL stored at /media/<key>, or '' if not set."""
-    val = fb_get(f"media/{key}")
-    return val if isinstance(val, str) and val.startswith("http") else ""
-
-# ═════════════════════════════════════════════════════════════════════════════
-# HTML UTILITIES
+# HTML / MEDIA UTILITIES
 # ═════════════════════════════════════════════════════════════════════════════
 
 def esc(text: str) -> str:
-    """Escape &, <, > so dynamic text is safe inside HTML messages."""
+    """Escape &, <, > so dynamic content is safe inside HTML messages."""
     return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 def mention(user) -> str:
-    """Inline HTML mention — clickable name that opens the user's profile."""
+    """Clickable inline HTML mention."""
     name = esc(user.full_name or user.first_name or "User")
     return f'<a href="tg://user?id={user.id}">{name}</a>'
+
+def get_media(key: str) -> str:
+    """
+    Return the direct URL stored at /media/<key> in Firebase, or '' if not set.
+
+    To change any poster, go to Firebase Console → Realtime Database and set:
+        /media/<key>  =  "https://your-image-or-gif-url"
+    """
+    val = fb_get(f"media/{key}")
+    return val if isinstance(val, str) and val.startswith("http") else ""
+
+async def send_embed(message, media_key: str, text: str, reply_markup=None):
+    """
+    Core embed sender used by every feature that has a poster.
+
+    Strategy:
+      1. Fetch poster URL from Firebase at /media/<media_key>
+      2. If URL exists  → send as photo with HTML caption
+         Telegram caption limit is 1024 chars. If text > 1024 the photo is
+         sent first, then the text as a separate message.
+      3. If no URL set  → send as plain HTML text message
+      4. On any error   → fall back to plain text (bot never crashes)
+    """
+    url    = get_media(media_key)
+    kwargs = dict(parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+
+    try:
+        if url:
+            if len(text) <= 1024:
+                await message.reply_photo(photo=url, caption=text, **kwargs)
+            else:
+                # Send image without caption, then text separately
+                await message.reply_photo(photo=url)
+                await message.reply_text(text, **kwargs)
+        else:
+            await message.reply_text(text, **kwargs)
+    except Exception as e:
+        logger.warning(f"send_embed({media_key}) error: {e} — falling back to text")
+        try:
+            await message.reply_text(text, **kwargs)
+        except Exception as e2:
+            logger.error(f"send_embed plain fallback also failed: {e2}")
 
 # ═════════════════════════════════════════════════════════════════════════════
 # ADMIN / SELF-RESPECT CHECKS
@@ -136,7 +163,7 @@ async def is_group_owner(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
 async def self_respect(update: Update, context: ContextTypes.DEFAULT_TYPE,
                         target_id: int) -> bool:
-    """Returns True (blocks action) if target is the bot, bot owner, or group owner."""
+    """Returns True (blocks action) when target is the bot, bot owner, or group owner."""
     if target_id == context.bot.id:
         await update.message.reply_text("❌ I won't act on myself.")
         return True
@@ -162,126 +189,95 @@ async def resolve_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return None
 
 # ═════════════════════════════════════════════════════════════════════════════
-# SHARED SEND HELPER — photo+caption if poster exists, else plain text
-# ═════════════════════════════════════════════════════════════════════════════
-
-async def send_with_poster(message, media_key: str, text: str,
-                            reply_markup=None):
-    """
-    Try to send a photo with caption from Firebase poster URL.
-    Falls back to plain text if no poster is set or if the photo send fails.
-    Telegram caption limit is 1024 chars — text is safe at our lengths.
-    """
-    url = get_media(media_key)
-    kwargs = dict(parse_mode=ParseMode.HTML, reply_markup=reply_markup)
-    try:
-        if url:
-            await message.reply_photo(photo=url, caption=text, **kwargs)
-        else:
-            await message.reply_text(text, **kwargs)
-    except Exception as e:
-        logger.warning(f"send_with_poster({media_key}) fell back: {e}")
-        try:
-            await message.reply_text(text, **kwargs)
-        except Exception as e2:
-            logger.error(f"send_with_poster plain fallback failed: {e2}")
-
-# ═════════════════════════════════════════════════════════════════════════════
-# HELP TEXT — styled embed as required in prompt
+# HELP TEXT  — styled embed exactly as specified in the original prompt
+# Uses a bold monospace-style font via Unicode bold chars in the header,
+# <code> tags for commands (monospace font), and separator lines.
 # ═════════════════════════════════════════════════════════════════════════════
 
 HELP_TEXT = (
-    "┌─────────────────────────────┐\n"
-    "│     <b>Knowledge Pro AI — Help</b>  │\n"
-    "└─────────────────────────────┘\n\n"
+    # ── Header ────────────────────────────────────────────────────────────────
+    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    "          <b>Help Command</b>\n"
+    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+    # ── Basic ──────────────────────────────────────────────────────────────────
     "📌 <b>Basic Commands</b>\n"
-    "<code>/start</code>  ➜  Welcome message\n"
-    "<code>/help</code>   ➜  This help menu\n"
-    "<code>/id</code>     ➜  Your Telegram ID\n"
-    "<code>/roll</code>   ➜  Roll a dice 🎲\n\n"
-    "──────────────────────────────\n"
+    "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+    "<code>/start</code>   ➜  Welcome message\n"
+    "<code>/help</code>    ➜  This help menu\n"
+    "<code>/id</code>      ➜  Your Telegram ID\n"
+    "<code>/roll</code>    ➜  Roll a dice 🎲\n\n"
+
+    # ── Moderation ────────────────────────────────────────────────────────────
     "🛡 <b>Moderation</b>\n"
-    "<code>/kick</code>   @user  ➜  Kick from group\n"
-    "<code>/ban</code>    @user  ➜  Permanently ban\n"
-    "<code>/mute</code>   @user  ➜  Silence user\n"
-    "<code>/unmute</code> @user  ➜  Restore voice\n"
-    "<code>/promote</code> @user ➜  Make admin\n"
-    "<code>/demote</code>  @user ➜  Remove admin\n"
-    "<code>/pin</code>          ➜  Pin replied msg\n"
-    "<code>/unpin</code>        ➜  Unpin message\n"
-    "<code>/permission</code> @user perm on|off\n\n"
-    "──────────────────────────────\n"
+    "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+    "<code>/kick @user</code>                ➜  Kick from group\n"
+    "<code>/ban @user</code>                 ➜  Permanently ban\n"
+    "<code>/mute @user</code>                ➜  Silence a user\n"
+    "<code>/unmute @user</code>              ➜  Restore voice\n"
+    "<code>/promote @user</code>             ➜  Make admin\n"
+    "<code>/demote @user</code>              ➜  Remove admin\n"
+    "<code>/pin</code>                       ➜  Pin replied message\n"
+    "<code>/unpin</code>                     ➜  Unpin message\n"
+    "<code>/permission @user perm on|off</code>\n\n"
+
+    # ── Auto Reply ────────────────────────────────────────────────────────────
     "💬 <b>Auto Reply</b>\n"
-    "<code>/autoreply set</code> word | reply\n"
+    "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+    "<code>/autoreply set word | reply</code>\n"
     "<code>/autoreply list</code>\n"
-    "<code>/autoreply delete</code> word\n\n"
-    "──────────────────────────────\n"
+    "<code>/autoreply delete word</code>\n\n"
+
+    # ── Shout ─────────────────────────────────────────────────────────────────
     "📢 <b>Shout</b>\n"
-    "<code>/shout</code> message  ➜  Announce\n"
-    "<code>/shoutconfig</code>    ➜  Config panel\n\n"
-    "──────────────────────────────\n"
+    "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+    "<code>/shout message</code>    ➜  Make announcement\n"
+    "<code>/shoutconfig</code>      ➜  Open config panel\n\n"
+
+    # ── AFK ───────────────────────────────────────────────────────────────────
     "💤 <b>AFK</b>\n"
-    "<code>/afk</code> reason  ➜  Go AFK\n\n"
-    "──────────────────────────────\n"
+    "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+    "<code>/afk reason</code>       ➜  Set AFK status\n\n"
+
+    # ── Nuke ──────────────────────────────────────────────────────────────────
     "💣 <b>Nuke</b>\n"
-    "<code>/nuke</code>  ➜  Bulk delete messages\n\n"
-    "──────────────────────────────\n"
+    "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+    "<code>/nuke</code>             ➜  Bulk delete messages\n\n"
+
+    # ── YouTube ───────────────────────────────────────────────────────────────
     "📥 <b>YouTube Downloader</b>\n"
-    "<code>/yt_dow</code> url mp4|mp3\n\n"
-    "└─────────────────────────────┘"
+    "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+    "<code>/yt_dow url mp4|mp3</code>\n\n"
+
+    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 )
 
 # ═════════════════════════════════════════════════════════════════════════════
-# /start
+# /start  — welcome poster from Firebase /media/welcome
 # ═════════════════════════════════════════════════════════════════════════════
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    text = (
+
+    welcome_text = (
         f"👋 <b>Welcome, {mention(user)}!</b>\n\n"
         "🤖 <b>About Me</b>\n"
-        "I'm <b>Knowledge Pro AI</b> — I moderate your groups "
-        "your way. Fully customisable and easy.\n\n"
+        "I'm <b>Knowledge Pro AI</b> that moderates your groups your way. "
+        "Fully customisable and easy.\n\n"
         + HELP_TEXT
     )
-    # Telegram photo caption max = 1024 chars.
-    # If text > 1024, send photo first then text separately.
-    url = get_media("welcome")
-    try:
-        if url:
-            if len(text) <= 1024:
-                await update.message.reply_photo(
-                    photo=url, caption=text, parse_mode=ParseMode.HTML
-                )
-            else:
-                await update.message.reply_photo(photo=url)
-                await update.message.reply_text(text, parse_mode=ParseMode.HTML)
-        else:
-            await update.message.reply_text(text, parse_mode=ParseMode.HTML)
-    except Exception as e:
-        logger.error(f"cmd_start: {e}")
-        await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+    # poster key: "welcome"  ← set /media/welcome in Firebase to any image/gif URL
+    await send_embed(update.message, "welcome", welcome_text)
 
 # ═════════════════════════════════════════════════════════════════════════════
-# /help  — styled embed + help poster from Firebase
+# /help  — help poster from Firebase /media/help
+#          Styled embed with separator lines and all commands shown
 # ═════════════════════════════════════════════════════════════════════════════
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    url = get_media("help")
-    try:
-        if url:
-            if len(HELP_TEXT) <= 1024:
-                await update.message.reply_photo(
-                    photo=url, caption=HELP_TEXT, parse_mode=ParseMode.HTML
-                )
-            else:
-                await update.message.reply_photo(photo=url)
-                await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.HTML)
-        else:
-            await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.HTML)
-    except Exception as e:
-        logger.error(f"cmd_help: {e}")
-        await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.HTML)
+    # poster key: "help"  ← set /media/help in Firebase to any image/gif URL
+    await send_embed(update.message, "help", HELP_TEXT)
 
 # ═════════════════════════════════════════════════════════════════════════════
 # /id   /roll
@@ -295,20 +291,20 @@ async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"💬 <b>Chat ID:</b> <code>{chat.id}</code>"
     )
     if update.message.reply_to_message:
-        ru = update.message.reply_to_message.from_user
-        text += f"\n🔍 <b>{esc(ru.first_name or 'User')}'s ID:</b> <code>{ru.id}</code>"
+        ru    = update.message.reply_to_message.from_user
+        fname = esc(ru.first_name or "User")
+        text += f"\n🔍 <b>{fname}'s ID:</b> <code>{ru.id}</code>"
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 async def cmd_roll(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    n = random.randint(1, 6)
+    n     = random.randint(1, 6)
     faces = ["⚀ 1", "⚁ 2", "⚂ 3", "⚃ 4", "⚄ 5", "⚅ 6"]
     await update.message.reply_text(
-        f"🎲 You rolled: <b>{faces[n - 1]}</b>",
-        parse_mode=ParseMode.HTML
+        f"🎲 You rolled: <b>{faces[n - 1]}</b>", parse_mode=ParseMode.HTML
     )
 
 # ═════════════════════════════════════════════════════════════════════════════
-# MODERATION COMMANDS
+# MODERATION
 # ═════════════════════════════════════════════════════════════════════════════
 
 async def cmd_kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -449,18 +445,17 @@ PERM_MAP = {
 }
 
 async def cmd_permission(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Usage: /permission @user <perm> on|off"""
     if not await is_admin(update, context):
         return await update.message.reply_text("❌ Admins only.")
     if len(context.args) < 3:
         return await update.message.reply_text(
-            f"Usage: /permission @user perm on|off\nPerms: {', '.join(PERM_MAP)}"
+            f"Usage: /permission @user perm on|off\nAvailable: {', '.join(PERM_MAP)}"
         )
     target    = await resolve_target(update, context)
     perm_name = context.args[1].lower()
     toggle    = context.args[2].lower() == "on"
     if perm_name not in PERM_MAP:
-        return await update.message.reply_text(f"❓ Unknown perm. Choose: {', '.join(PERM_MAP)}")
+        return await update.message.reply_text(f"❓ Unknown perm. Available: {', '.join(PERM_MAP)}")
     if not target:
         return await update.message.reply_text("❓ User not found.")
     if await self_respect(update, context, target.id):
@@ -521,43 +516,39 @@ async def cmd_autoreply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sub     = context.args[0].lower()
     chat_id = str(update.effective_chat.id)
 
-    # ── set ──────────────────────────────────────────────────────────────────
     if sub == "set":
         raw = " ".join(context.args[1:])
         if "|" not in raw:
-            return await update.message.reply_text(
-                "❓ Format: /autoreply set word | response"
-            )
+            return await update.message.reply_text("❓ Format: /autoreply set word | response")
         word, response = [x.strip() for x in raw.split("|", 1)]
         if not word or not response:
             return await update.message.reply_text("❓ Word and response cannot be empty.")
         fb_set(f"autoreply/{chat_id}/{word}", response)
         await update.message.reply_text(
             f"✅ Auto-reply saved:\n"
-            f"Trigger: <code>{esc(word)}</code>\n"
-            f"Reply: {esc(response)}",
+            f"Trigger → <code>{esc(word)}</code>\n"
+            f"Reply   → {esc(response)}",
             parse_mode=ParseMode.HTML
         )
 
-    # ── list ──────────────────────────────────────────────────────────────────
     elif sub == "list":
         data = fb_get(f"autoreply/{chat_id}")
         if not data:
             return await update.message.reply_text("📭 No auto-replies saved yet.")
 
         lines = [
-            "┌──────────────────────────┐",
-            "│   <b>Auto Reply List</b>         │",
-            "└──────────────────────────┘\n",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "        <b>Auto Reply List</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n",
         ]
         for word, resp in data.items():
             lines.append(f"• <code>{esc(word)}</code>  ➜  {esc(resp)}")
+        lines.append("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
         text = "\n".join(lines)
-        # poster: autoreply_poster (editable in Firebase)
-        await send_with_poster(update.message, "autoreply_poster", text)
+        # poster key: "autoreply_poster"  ← set /media/autoreply_poster in Firebase
+        await send_embed(update.message, "autoreply_poster", text)
 
-    # ── delete ────────────────────────────────────────────────────────────────
     elif sub == "delete":
         if len(context.args) < 2:
             return await update.message.reply_text("❓ Provide the word to delete.")
@@ -580,26 +571,26 @@ async def cmd_shout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         return await update.message.reply_text("❓ Usage: /shout message")
 
-    message = " ".join(context.args)
+    msg     = " ".join(context.args)
     chat_id = str(update.effective_chat.id)
 
     blocked = fb_get(f"shout_config/{chat_id}/blocked_words") or {}
     for bw in blocked:
-        if bw.lower() in message.lower():
+        if bw.lower() in msg.lower():
             return await update.message.reply_text(
                 f"🚫 Blocked word detected: <b>{esc(bw)}</b>",
                 parse_mode=ParseMode.HTML
             )
 
-    text = (
+    await update.message.reply_text(
         "📢 <b>— ANNOUNCEMENT —</b>\n"
-        "─────────────────────────\n"
-        f"{esc(message)}\n"
-        "─────────────────────────"
+        "──────────────────────────────\n"
+        f"{esc(msg)}\n"
+        "──────────────────────────────",
+        parse_mode=ParseMode.HTML
     )
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
-# ── /shoutconfig ─────────────────────────────────────────────────────────────
+# ─── /shoutconfig ─────────────────────────────────────────────────────────────
 
 async def cmd_shoutconfig(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update, context):
@@ -607,7 +598,8 @@ async def cmd_shoutconfig(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat_id     = str(update.effective_chat.id)
     gif_blocked = fb_get(f"shout_config/{chat_id}/gif_blocked") or False
-    gif_label   = "🎞 GIF Blocker: ON ✅  (tap to turn OFF)" if gif_blocked else "🎞 GIF Blocker: OFF ❌  (tap to turn ON)"
+    gif_label   = "🎞 GIF Blocker: ON ✅  (tap to turn OFF)" if gif_blocked \
+                  else "🎞 GIF Blocker: OFF ❌  (tap to turn ON)"
 
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Add Blocked Word",    callback_data=f"shout_add|{chat_id}")],
@@ -616,16 +608,20 @@ async def cmd_shoutconfig(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ])
 
     text = (
-        "┌───────────────────────────────┐\n"
-        "│  <b>Shout Configuration Panel</b>   │\n"
-        "└───────────────────────────────┘\n\n"
-        "• <b>Add Blocked Word</b> — bot will refuse to shout messages containing that word\n"
-        "• <b>Remove Blocked Word</b> — unblock a word\n"
-        "• <b>GIF Blocker</b> — prevent GIFs from being sent in the group\n\n"
-        f"GIF Blocker status: <b>{'ON ✅' if gif_blocked else 'OFF ❌'}</b>"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "    <b>Shout Configuration Panel</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "• <b>Add Blocked Word</b>\n"
+        "  Bot will refuse to shout messages containing that word.\n\n"
+        "• <b>Remove Blocked Word</b>\n"
+        "  Unblock a previously blocked word.\n\n"
+        "• <b>GIF Blocker</b>\n"
+        "  Prevent any GIF from being sent in the group.\n\n"
+        f"GIF Blocker status: <b>{'ON ✅' if gif_blocked else 'OFF ❌'}</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
-    # poster: shout_config (editable in Firebase)
-    await send_with_poster(update.message, "shout_config", text, reply_markup=keyboard)
+    # poster key: "shout_config"  ← set /media/shout_config in Firebase
+    await send_embed(update.message, "shout_config", text, reply_markup=keyboard)
 
 async def shoutconfig_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -668,7 +664,7 @@ async def shoutconfig_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         )
 
 # ═════════════════════════════════════════════════════════════════════════════
-# AFK
+# AFK  — poster from Firebase /media/afk_poster
 # ═════════════════════════════════════════════════════════════════════════════
 
 async def cmd_afk(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -679,17 +675,18 @@ async def cmd_afk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fb_set(f"afk/{chat_id}/{user.id}", {"reason": reason, "name": user.full_name})
 
     text = (
-        "┌─────────────────────────┐\n"
-        "│        <b>💤 AFK</b>          │\n"
-        "└─────────────────────────┘\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "              <b>💤  AFK</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"👤 {mention(user)} is now AFK\n"
-        f"📝 <b>Reason:</b> {esc(reason)}"
+        f"📝 <b>Reason:</b> {esc(reason)}\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
-    # poster: afk_poster (editable in Firebase)
-    await send_with_poster(update.message, "afk_poster", text)
+    # poster key: "afk_poster"  ← set /media/afk_poster in Firebase
+    await send_embed(update.message, "afk_poster", text)
 
 async def check_afk_return(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Remove AFK when the user sends any message, voice note, or GIF."""
+    """Remove AFK status when the user sends any message, voice note, or GIF."""
     if not update.effective_user or not update.effective_chat:
         return
     user    = update.effective_user
@@ -705,34 +702,35 @@ async def check_afk_return(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 # ═════════════════════════════════════════════════════════════════════════════
-# NUKE
+# NUKE  — panel poster from Firebase /media/nuke_poster
 # ═════════════════════════════════════════════════════════════════════════════
 
 async def cmd_nuke(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update, context):
         return await update.message.reply_text("❌ Admins only.")
 
-    chat_id = str(update.effective_chat.id)
+    chat_id  = str(update.effective_chat.id)
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("💥 100",    callback_data=f"nuke|{chat_id}|100"),
-            InlineKeyboardButton("💥 200",    callback_data=f"nuke|{chat_id}|200"),
+            InlineKeyboardButton("💥 100",   callback_data=f"nuke|{chat_id}|100"),
+            InlineKeyboardButton("💥 200",   callback_data=f"nuke|{chat_id}|200"),
         ],
         [
-            InlineKeyboardButton("☢️ 8900",   callback_data=f"nuke|{chat_id}|8900"),
-            InlineKeyboardButton("❌ Cancel",  callback_data=f"nuke|{chat_id}|cancel"),
+            InlineKeyboardButton("☢️ 8900",  callback_data=f"nuke|{chat_id}|8900"),
+            InlineKeyboardButton("❌ Cancel", callback_data=f"nuke|{chat_id}|cancel"),
         ],
     ])
 
     text = (
-        "┌──────────────────────────┐\n"
-        "│      <b>☢️ Nuke Panel</b>     │\n"
-        "└──────────────────────────┘\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "           <b>☢️  Nuke Panel</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         "⚠️ Choose how many messages to delete.\n"
-        "This action <b>cannot</b> be undone."
+        "This action <b>cannot</b> be undone.\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
-    # poster: nuke_poster (editable in Firebase)
-    await send_with_poster(update.message, "nuke_poster", text, reply_markup=keyboard)
+    # poster key: "nuke_poster"  ← set /media/nuke_poster in Firebase
+    await send_embed(update.message, "nuke_poster", text, reply_markup=keyboard)
 
 async def nuke_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -758,7 +756,9 @@ async def nuke_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-    status = await query.message.reply_text(f"☢️ Nuking <b>{count}</b> messages...", parse_mode=ParseMode.HTML)
+    status  = await query.message.reply_text(
+        f"☢️ Nuking <b>{count}</b> messages...", parse_mode=ParseMode.HTML
+    )
     deleted = 0
     msg_id  = query.message.message_id
 
@@ -772,63 +772,169 @@ async def nuke_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             continue
 
     try:
-        await status.edit_text(f"✅ Done — deleted approximately <b>{deleted}</b> messages.", parse_mode=ParseMode.HTML)
+        await status.edit_text(
+            f"✅ Done — deleted approximately <b>{deleted}</b> messages.",
+            parse_mode=ParseMode.HTML
+        )
     except Exception:
         pass
 
 # ═════════════════════════════════════════════════════════════════════════════
 # YOUTUBE DOWNLOADER
+# ─────────────────────────────────────────────────────────────────────────────
+# Fixes applied:
+#   1. "cookiesfrombrowser" key is NEVER present in the opts dict at all.
+#      Setting it to None still triggers Chrome lookup in some yt-dlp versions.
+#      The only safe fix is to never include the key.
+#   2. extractor_args bypass YouTube's sign-in / bot-detection (player_client
+#      android + web_creator avoids the "sign in to confirm you're not a bot"
+#      gate that was causing the login error).
+#   3. Optional cookies.txt support via YT_COOKIES_FILE env var for
+#      age-restricted videos — file must exist for it to be used.
+#   4. All DownloadError messages are caught and shown cleanly to the user.
 # ═════════════════════════════════════════════════════════════════════════════
+
+_YT_COOKIES_FILE = os.environ.get("YT_COOKIES_FILE", "")  # optional — Netscape cookies.txt
+
+
+def _build_ydl_opts(fmt: str, outtmpl: str) -> dict:
+    """
+    Build a clean yt-dlp options dict.
+    IMPORTANT: 'cookiesfrombrowser' must NOT appear as a key at all.
+    Setting it to None still causes yt-dlp to attempt a browser lookup.
+    """
+    opts = {
+        # ── output ────────────────────────────────────────────────────────────
+        "outtmpl":      outtmpl,
+        "noplaylist":   True,
+
+        # ── silence ───────────────────────────────────────────────────────────
+        "quiet":        True,
+        "no_warnings":  True,
+
+        # ── bypass YouTube bot-detection WITHOUT needing a browser / login ────
+        # android + web_creator clients are not blocked by YouTube's
+        # "sign in to confirm you're not a bot" challenge.
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "web_creator"],
+                "skip":          ["translated_subs"],
+            }
+        },
+
+        # ── spoof a real browser User-Agent ───────────────────────────────────
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Linux; Android 13; Pixel 7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.6367.82 Mobile Safari/537.36"
+            ),
+        },
+
+        # ── retries ───────────────────────────────────────────────────────────
+        "retries":          3,
+        "fragment_retries": 3,
+    }
+
+    # Only add cookiefile if user has placed a valid cookies.txt on disk
+    if _YT_COOKIES_FILE and os.path.isfile(_YT_COOKIES_FILE):
+        opts["cookiefile"] = _YT_COOKIES_FILE
+
+    # ── format ────────────────────────────────────────────────────────────────
+    if fmt == "mp4":
+        # cap at 720p so files stay under Telegram's 50 MB limit
+        opts["format"] = (
+            "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]"
+            "/bestvideo[height<=720]+bestaudio"
+            "/best[height<=720]/best"
+        )
+    else:  # mp3
+        opts["format"] = "bestaudio/best"
+        opts["postprocessors"] = [{
+            "key":              "FFmpegExtractAudio",
+            "preferredcodec":   "mp3",
+            "preferredquality": "192",
+        }]
+
+    return opts
+
+
+def _friendly_yt_error(raw: str) -> str:
+    """Convert a raw yt-dlp error string into a user-friendly message."""
+    msg = raw.lower()
+    if any(k in msg for k in ("sign in", "login required", "confirm your age",
+                               "age-restrict", "age restrict")):
+        return (
+            "This video is age-restricted or requires sign-in.\n"
+            "Only public, unrestricted videos can be downloaded."
+        )
+    if any(k in msg for k in ("private video", "private", "members only")):
+        return "This video is private or members-only and cannot be downloaded."
+    if any(k in msg for k in ("copyright", "not available", "unavailable",
+                               "removed", "blocked")):
+        return "This video is unavailable, removed, or blocked in this region."
+    if "confirm you" in msg or "bot" in msg:
+        return (
+            "YouTube is requesting bot verification for this video.\n"
+            "Please try again in a few minutes or try a different video."
+        )
+    # Return a trimmed version of the raw error for anything else
+    return raw.split("\n")[0][:300]
+
 
 async def cmd_yt_dow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 2:
         return await update.message.reply_text(
-            "❓ Usage: /yt_dow url mp4|mp3"
+            "❓ Usage: /yt_dow url mp4|mp3\n\n"
+            "Example:\n"
+            "<code>/yt_dow https://youtu.be/dQw4w9WgXcQ mp4</code>",
+            parse_mode=ParseMode.HTML
         )
+
     url = context.args[0]
     fmt = context.args[1].lower()
     if fmt not in ("mp4", "mp3"):
-        return await update.message.reply_text("❓ Format must be mp4 or mp3.")
+        return await update.message.reply_text("❓ Format must be <code>mp4</code> or <code>mp3</code>.",
+                                               parse_mode=ParseMode.HTML)
 
-    status = await update.message.reply_text("⏳ Downloading, please wait...")
+    status = await update.message.reply_text("⏳ Fetching video info...")
 
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
-            outtmpl = os.path.join(tmpdir, "%(title)s.%(ext)s")
-            if fmt == "mp4":
-                ydl_opts = {
-                    "format":  "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-                    "outtmpl": outtmpl,
-                    "quiet":   True,
-                    'cookiesfrombrowser': ('chrome',), 
-                }
-            else:
-                ydl_opts = {
-                    "format":  "bestaudio/best",
-                    "outtmpl": outtmpl,
-                    "postprocessors": [{
-                        "key":              "FFmpegExtractAudio",
-                        "preferredcodec":   "mp3",
-                        "preferredquality": "192",
-                    }],
-                    "quiet": True,
-                }
+            outtmpl  = os.path.join(tmpdir, "%(title)s.%(ext)s")
+            ydl_opts = _build_ydl_opts(fmt, outtmpl)
 
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info  = ydl.extract_info(url, download=True)
-                title = info.get("title", "video")
+            try:
+                await status.edit_text("⏳ Downloading, please wait...")
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info  = ydl.extract_info(url, download=True)
+                    title = info.get("title", "video")
+
+            except yt_dlp.utils.DownloadError as dl_err:
+                friendly = _friendly_yt_error(str(dl_err))
+                return await status.edit_text(
+                    f"❌ <b>Download failed</b>\n\n{esc(friendly)}",
+                    parse_mode=ParseMode.HTML
+                )
 
             files = os.listdir(tmpdir)
             if not files:
-                return await status.edit_text("❌ Download failed — no output file.")
+                return await status.edit_text("❌ Download produced no file. Try a different URL.")
 
             filepath = os.path.join(tmpdir, files[0])
-            if os.path.getsize(filepath) > 50 * 1024 * 1024:
-                return await status.edit_text("❌ File is over 50 MB — too large for Telegram.")
+            size_mb  = os.path.getsize(filepath) / (1024 * 1024)
+
+            if size_mb > 50:
+                return await status.edit_text(
+                    f"❌ File is {size_mb:.1f} MB — Telegram limit is 50 MB.\n"
+                    "Try downloading as mp3 instead."
+                )
 
             await status.edit_text(
-                f"📤 Uploading <b>{esc(title)}</b>...", parse_mode=ParseMode.HTML
+                f"📤 Uploading <b>{esc(title)}</b> ({size_mb:.1f} MB)...",
+                parse_mode=ParseMode.HTML
             )
+
             with open(filepath, "rb") as f:
                 if fmt == "mp4":
                     await update.message.reply_video(video=f, caption=f"🎬 {title}")
@@ -838,11 +944,14 @@ async def cmd_yt_dow(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status.delete()
 
     except Exception as e:
-        logger.error(f"yt_dow: {e}")
-        await status.edit_text(f"❌ Error: {esc(str(e))}", parse_mode=ParseMode.HTML)
+        logger.error(f"yt_dow unexpected error: {e}")
+        await status.edit_text(
+            f"❌ <b>Unexpected error</b>\n{esc(str(e)[:300])}",
+            parse_mode=ParseMode.HTML
+        )
 
 # ═════════════════════════════════════════════════════════════════════════════
-# MESSAGE HANDLER — AFK return • GIF blocker • blocked-word input • auto-reply
+# MESSAGE HANDLER — AFK return · GIF blocker · blocked-word input · auto-reply
 # ═════════════════════════════════════════════════════════════════════════════
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -851,7 +960,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat_id = str(update.effective_chat.id)
 
-    # 1. AFK return
+    # 1. AFK return check
     await check_afk_return(update, context)
 
     # 2. GIF blocker
@@ -886,7 +995,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 break
 
 # ═════════════════════════════════════════════════════════════════════════════
-# KEEP-ALIVE  (Flask + waitress — prevents Render/Railway from sleeping)
+# KEEP-ALIVE  (Flask + waitress)
 # ═════════════════════════════════════════════════════════════════════════════
 
 _flask_app = Flask(__name__)
@@ -914,37 +1023,36 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # ── Handlers ─────────────────────────────────────────────────────────────
-    app.add_handler(CommandHandler("start",        cmd_start))
-    app.add_handler(CommandHandler("help",         cmd_help))
-    app.add_handler(CommandHandler("id",           cmd_id))
-    app.add_handler(CommandHandler("roll",         cmd_roll))
+    app.add_handler(CommandHandler("start",       cmd_start))
+    app.add_handler(CommandHandler("help",        cmd_help))
+    app.add_handler(CommandHandler("id",          cmd_id))
+    app.add_handler(CommandHandler("roll",        cmd_roll))
 
-    app.add_handler(CommandHandler("kick",         cmd_kick))
-    app.add_handler(CommandHandler("ban",          cmd_ban))
-    app.add_handler(CommandHandler("mute",         cmd_mute))
-    app.add_handler(CommandHandler("unmute",       cmd_unmute))
-    app.add_handler(CommandHandler("promote",      cmd_promote))
-    app.add_handler(CommandHandler("demote",       cmd_demote))
-    app.add_handler(CommandHandler("permission",   cmd_permission))
-    app.add_handler(CommandHandler("pin",          cmd_pin))
-    app.add_handler(CommandHandler("unpin",        cmd_unpin))
+    app.add_handler(CommandHandler("kick",        cmd_kick))
+    app.add_handler(CommandHandler("ban",         cmd_ban))
+    app.add_handler(CommandHandler("mute",        cmd_mute))
+    app.add_handler(CommandHandler("unmute",      cmd_unmute))
+    app.add_handler(CommandHandler("promote",     cmd_promote))
+    app.add_handler(CommandHandler("demote",      cmd_demote))
+    app.add_handler(CommandHandler("permission",  cmd_permission))
+    app.add_handler(CommandHandler("pin",         cmd_pin))
+    app.add_handler(CommandHandler("unpin",       cmd_unpin))
 
-    app.add_handler(CommandHandler("autoreply",    cmd_autoreply))
+    app.add_handler(CommandHandler("autoreply",   cmd_autoreply))
 
-    app.add_handler(CommandHandler("shout",        cmd_shout))
-    app.add_handler(CommandHandler("shoutconfig",  cmd_shoutconfig))
+    app.add_handler(CommandHandler("shout",       cmd_shout))
+    app.add_handler(CommandHandler("shoutconfig", cmd_shoutconfig))
 
-    app.add_handler(CommandHandler("afk",          cmd_afk))
-    app.add_handler(CommandHandler("nuke",         cmd_nuke))
-    app.add_handler(CommandHandler("yt_dow",       cmd_yt_dow))
+    app.add_handler(CommandHandler("afk",         cmd_afk))
+    app.add_handler(CommandHandler("nuke",        cmd_nuke))
+    app.add_handler(CommandHandler("yt_dow",      cmd_yt_dow))
 
     app.add_handler(CallbackQueryHandler(shoutconfig_callback, pattern=r"^shout_"))
     app.add_handler(CallbackQueryHandler(nuke_callback,        pattern=r"^nuke\|"))
 
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
 
-    logger.info("🤖 Knowledge Pro AI Bot starting...")
+    logger.info("Knowledge Pro AI Bot starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
