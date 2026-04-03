@@ -800,6 +800,7 @@ async def cmd_yt_dow(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "format":  "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
                     "outtmpl": outtmpl,
                     "quiet":   True,
+                    'cookiesfrombrowser': ('chrome',), 
                 }
             else:
                 ydl_opts = {
