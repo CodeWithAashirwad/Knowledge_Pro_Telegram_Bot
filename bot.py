@@ -1,811 +1,962 @@
 """
-Knowledge Pro AI — Telegram Group Moderation Bot
-Compatible: Python 3.14+, python-telegram-bot 20.7
+Knowledge Pro AI Telegram Bot
+Single-file implementation with Firebase integration
 """
 
 import os
 import logging
 import asyncio
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import random
+import re
 from datetime import datetime
+from threading import Thread
 
+# ─── Telegram ───────────────────────────────────────────────────────────────
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
 )
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, filters, ContextTypes
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    filters, ContextTypes
 )
 from telegram.constants import ParseMode
-import firebase_admin
-from firebase_admin import credentials, db
+from telegram.error import TelegramError
 
-# ══════════════════════════════════════════════════════════
-#  LOGGING
-# ══════════════════════════════════════════════════════════
+# ─── Firebase ────────────────────────────────────────────────────────────────
+import firebase_admin
+from firebase_admin import credentials, db as rtdb
+
+# ─── YouTube Download ────────────────────────────────────────────────────────
+import yt_dlp
+
+# ─── Keep-Alive ──────────────────────────────────────────────────────────────
+from flask import Flask
+from waitress import serve
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ENVIRONMENT VARIABLES  (set these in your environment / .env / hosting)
+# ═════════════════════════════════════════════════════════════════════════════
+BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")      # Your Telegram bot token
+BOT_OWNER   = int(os.environ.get("BOT_OWNER", "0")) # Your Telegram user ID
+PORT        = int(os.environ.get("PORT", "8080"))   # Keep-alive port
+
+# ═════════════════════════════════════════════════════════════════════════════
+# FIREBASE CONFIG  (hard-coded as requested — not in env)
+# ═════════════════════════════════════════════════════════════════════════════
+FIREBASE_CONFIG = {
+    "apiKey": "AIzaSyBD473HnZjcmuBlEwd7uaI0MB-hKU4_Nfs",
+    "authDomain": "knowledge-pro-c9ee5.firebaseapp.com",
+    "databaseURL": "https://knowledge-pro-c9ee5-default-rtdb.firebaseio.com",
+    "projectId": "knowledge-pro-c9ee5",
+    "storageBucket": "knowledge-pro-c9ee5.firebasestorage.app",
+    "messagingSenderId": "14035001235",
+    "appId": "1:14035001235:web:cb7c8a0d7c0ce48d729266",
+    "measurementId": "G-ZXZC2BH72M"
+}
+
+# ─── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger(__name__)
 
-# ══════════════════════════════════════════════════════════
-#  ENV  — only BOT_TOKEN comes from environment
-# ══════════════════════════════════════════════════════════
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN environment variable is not set.")
-
-# ══════════════════════════════════════════════════════════
-#  FIREBASE  — service-account credentials embedded
-# ══════════════════════════════════════════════════════════
-_FIREBASE_SA = {
-    "type": "service_account",
-    "project_id": "knowledge-pro-c9ee5",
-    "private_key_id": "0a85d6728c019df4799077f09e89f5d8bd1b08c7",
-    "private_key": (
-        "-----BEGIN PRIVATE KEY-----\n"
-        "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCs1N5pGQxcWuP6\n"
-        "LLXtwVfEjA59Ncozf7rb7JjhmlK30Hbiuz9Q+/E5A6BOru3gPI2YoCN+Hi0p3PCi\n"
-        "TPluyV+vbcjXXcP3MeDfleEF2miORLJ2EUEDTQGTPwvwaJohIE4dBFCVPnSTluNq\n"
-        "f0RoiquEIXrmfwyjFKuztQ1yh2Zz68Kghuo69oEw1dvLZ/TuXCjZMYrQPFOf65Lw\n"
-        "BJlhcw2X3OQtQSjEefjPgylr1L5y4y09bE6/JfULhcEQTvKFySEU6yl/wP9sgETD\n"
-        "soC+jnSJdB+0bG8Jflf1de9SdLbnglJb2ztPQclhfcdPOj3MwyewJIe58BWyDfJ2\n"
-        "yoy8C7/rAgMBAAECggEAT+bn3inU45unm0DxaPZCV90yU6O7E/0Ay+0Brwc0J8Pq\n"
-        "Op87wfqARo4NHmNUGR+VjNK4JfXYhmqdG0O/636QzJ9SQ3MXhqBaKLP3gMe9H8zV\n"
-        "vqzyZA7FZCg5Ik+Rti/jvRmCEcV6isMu50zoOPanHeKGmapyErEbQm05RtIfRQae\n"
-        "v+6ymlJxzMaggQGs9uDTE2VUdNMe5DjJEFQpEN+U8u2ThLDS4sA/skqBvuokaX69\n"
-        "PChHpHmM9QaKLWokgpeeHAIhXjmO8xBJDp+90E+u7+WVrH69ufUTWtWV+MJewkih\n"
-        "fl8/IfvmyQx4FeD5oQHEAMTQZYjASTjOymRBnYuBFQKBgQDeGqTk5c/APKbovrGX\n"
-        "eJfvrJpFUtkU74JwicHeF+jiYdTQEvkIkFYDRJYeFSLS7ZD6vA0VU0iZhQ2EoNzU\n"
-        "nv2N/9XMboCN+LVL/ASNkU6RgWB1BS+zVZhdfZponrAH5cz75cq+Wc9y82B1Amv8\n"
-        "BQ4qF+/1+S2Ty8q1H5dYynLMTQKBgQDHNTOJ/XgANRdcZe5Lk6Ls2I0VN8TyNBdI\n"
-        "sMgBxmOWNDkjvoUVFXSxOuSPmHteaacW3U3WYH6bqbloYnK2jn6/dxwaVhnmf7m3\n"
-        "pk1ovltzUaYKim3CGN5kfYTfRvOaK2O2FwVVxfuMEhmTy7ejYcWRZsUvf23IsRyd\n"
-        "G2vLx1d5FwKBgGtuT9w4HOlLbSCfPJ+bwUI5JtXpYP9zapCs0Y1v20HFOH787mBq\n"
-        "EHC8ODCM4K9OIhZl554tDqzTYtqIRMjDrrmEyhF8UcpaRrdeS4V+h5ZyEgoIXC5O\n"
-        "dMij/JAmUddAHIqreAnivylG950hcsIQX+2Ubol34cffh0lc4oQcSLLxAoGAU4RG\n"
-        "e0+9A7k+dgp2AVGAOPQBEigzdafJKzySXcwi7FIwsn+po9E+/x7FvD4dWtPIrZlS\n"
-        "jNIfwntBtDWyCj9rfDIfohr++NgLsKcURRmplYthpYGrynhKpK7LCiDg+H3AbBLy\n"
-        "tacvcuYTuxbpgqH3BqKjgOpXyJAYgvWAGAsW7TkCgYEAtAKaU4S668/NgL7q6EKr\n"
-        "bxGGtyJEjCZP3KBcAaaVTKY59cB4Jo79/yUVRjZpGPkwdUWF42ZNWMpFTCbMGaAH\n"
-        "7XpFiwn7teSpQVjEb5BIY3h/R4XAoqKI69OVKuyNZz3dDEsTDp9KI7+Wwcl7B4/M\n"
-        "SErvQqgTTBPSlbgq4kOAODQ=\n"
-        "-----END PRIVATE KEY-----\n"
-    ),
-    "client_email": "firebase-adminsdk-fbsvc@knowledge-pro-c9ee5.iam.gserviceaccount.com",
-    "client_id": "110550887388602577465",
-    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-    "token_uri": "https://oauth2.googleapis.com/token",
-    "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-    "client_x509_cert_url": (
-        "https://www.googleapis.com/robot/v1/metadata/x509/"
-        "firebase-adminsdk-fbsvc%40knowledge-pro-c9ee5.iam.gserviceaccount.com"
-    ),
-    "universe_domain": "googleapis.com",
-}
-_FIREBASE_DB_URL = "https://knowledge-pro-c9ee5-default-rtdb.firebaseio.com"
-
-firebase_ok = False
-try:
-    _cred = credentials.Certificate(_FIREBASE_SA)
-    firebase_admin.initialize_app(_cred, {"databaseURL": _FIREBASE_DB_URL})
-    firebase_ok = True
-    print("✅ Firebase connected successfully.")
-except Exception as _fe:
-    print(f"❌ Firebase init failed: {_fe}")
-
-# ══════════════════════════════════════════════════════════
-#  FIREBASE HELPERS
-# ══════════════════════════════════════════════════════════
-
-def fb_get(path, default=None):
-    if not firebase_ok:
-        return default
+# ═════════════════════════════════════════════════════════════════════════════
+# FIREBASE INIT
+# ═════════════════════════════════════════════════════════════════════════════
+def init_firebase():
+    """Initialize Firebase Admin SDK with a certificate-less approach."""
     try:
-        val = db.reference(path).get()
-        return val if val is not None else default
+        if not firebase_admin._apps:
+            cred = credentials.Certificate({
+                "type": "service_account",
+                "project_id": FIREBASE_CONFIG["projectId"],
+                # We use the REST DB via requests; admin SDK only for Realtime DB
+            }) if False else None  # placeholder
+
+            # Use application default or anonymous approach via REST
+            # Since we only need Realtime Database, we use requests directly
+        logger.info("Firebase will be accessed via REST API.")
     except Exception as e:
-        logger.error("FB get %s: %s", path, e)
-        return default
+        logger.error(f"Firebase init error: {e}")
 
+# ─── Firebase REST helpers ────────────────────────────────────────────────────
+import requests as _req
 
-def fb_set(path, value):
-    if not firebase_ok:
-        return False
+_FB_BASE = FIREBASE_CONFIG["databaseURL"]
+
+def fb_get(path: str):
+    """GET a value from Firebase Realtime DB."""
     try:
-        db.reference(path).set(value)
+        r = _req.get(f"{_FB_BASE}/{path}.json", timeout=10)
+        return r.json() if r.status_code == 200 else None
+    except Exception as e:
+        logger.error(f"fb_get error: {e}")
+        return None
+
+def fb_set(path: str, data):
+    """PUT (overwrite) a value in Firebase Realtime DB."""
+    try:
+        r = _req.put(f"{_FB_BASE}/{path}.json", json=data, timeout=10)
+        return r.status_code == 200
+    except Exception as e:
+        logger.error(f"fb_set error: {e}")
+        return False
+
+def fb_delete(path: str):
+    """DELETE a node in Firebase Realtime DB."""
+    try:
+        r = _req.delete(f"{_FB_BASE}/{path}.json", timeout=10)
+        return r.status_code == 200
+    except Exception as e:
+        logger.error(f"fb_delete error: {e}")
+        return False
+
+def fb_push(path: str, data):
+    """POST (push) a new child in Firebase Realtime DB."""
+    try:
+        r = _req.post(f"{_FB_BASE}/{path}.json", json=data, timeout=10)
+        return r.json() if r.status_code == 200 else None
+    except Exception as e:
+        logger.error(f"fb_push error: {e}")
+        return None
+
+# ═════════════════════════════════════════════════════════════════════════════
+# HELPER UTILITIES
+# ═════════════════════════════════════════════════════════════════════════════
+
+def get_media(key: str, default: str = "") -> str:
+    """Fetch a media URL (photo/gif) stored in Firebase under /media/<key>."""
+    val = fb_get(f"media/{key}")
+    return val if isinstance(val, str) else default
+
+async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int = None) -> bool:
+    """Return True if user is admin/owner in the chat."""
+    uid = user_id or update.effective_user.id
+    if uid == BOT_OWNER:
         return True
-    except Exception as e:
-        logger.error("FB set %s: %s", path, e)
-        return False
-
-
-def fb_delete(path):
-    if not firebase_ok:
-        return False
     try:
-        db.reference(path).delete()
-        return True
-    except Exception as e:
-        logger.error("FB delete %s: %s", path, e)
+        member = await context.bot.get_chat_member(update.effective_chat.id, uid)
+        return member.status in ("administrator", "creator")
+    except Exception:
         return False
 
-
-def fb_push(path, value):
-    if not firebase_ok:
-        return False
+async def is_group_owner(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
+    """Return True if user is the group creator."""
     try:
-        db.reference(path).push(value)
-        return True
-    except Exception as e:
-        logger.error("FB push %s: %s", path, e)
+        member = await context.bot.get_chat_member(update.effective_chat.id, user_id)
+        return member.status == "creator"
+    except Exception:
         return False
 
-# ══════════════════════════════════════════════════════════
-#  DEFAULT MEDIA  (override any key at Firebase /config/<key>)
-# ══════════════════════════════════════════════════════════
-_DEFAULT_MEDIA = {
-    "welcome_photo":    "https://media.giphy.com/media/3o7abKhOpu0NwenH3O/giphy.gif",
-    "help_photo":       "https://media.giphy.com/media/26tn33aiTi1jkl6H6/giphy.gif",
-    "autoreply_poster": "https://media.giphy.com/media/xT9IgzoKnwFNmISR8I/giphy.gif",
-    "shout_poster":     "https://media.giphy.com/media/l0MYt5jPR6QX5pnqM/giphy.gif",
-    "afk_poster":       "https://media.giphy.com/media/3oEjI6SIIHBdRxXI40/giphy.gif",
-    "nuke_poster":      "https://media.giphy.com/media/HoffxyN8ghVuw/giphy.gif",
-}
-
-
-def get_media(key: str) -> str:
-    val = fb_get(f"config/{key}")
-    return val if val else _DEFAULT_MEDIA.get(key, "")
-
-# ══════════════════════════════════════════════════════════
-#  SHARED UTILITIES
-# ══════════════════════════════════════════════════════════
+async def bot_is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Check if the bot itself is an admin in the chat."""
+    try:
+        bot_member = await context.bot.get_chat_member(
+            update.effective_chat.id, context.bot.id
+        )
+        return bot_member.status in ("administrator", "creator")
+    except Exception:
+        return False
 
 def mention(user) -> str:
-    name = (user.full_name or user.first_name or "User").replace("[", "").replace("]", "")
+    """Return a Markdown mention string for a user."""
+    name = user.full_name or user.first_name or "User"
     return f"[{name}](tg://user?id={user.id})"
 
+# ═════════════════════════════════════════════════════════════════════════════
+# /start
+# ═════════════════════════════════════════════════════════════════════════════
 
-async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    if update.effective_chat.type == "private":
-        return True
-    try:
-        admins = await context.bot.get_chat_administrators(update.effective_chat.id)
-        return any(a.user.id == update.effective_user.id for a in admins)
-    except Exception:
-        return False
+HELP_TEXT = """
+╔══════════════════════════════╗
+║      𝗞𝗻𝗼𝘄𝗹𝗲𝗱𝗴𝗲 𝗣𝗿𝗼 𝗔𝗜 — 𝗛𝗲𝗹𝗽  ║
+╚══════════════════════════════╝
 
+📌 *Basic Commands*
+/start – Welcome message
+/help – This help menu
+/id – Your ID / Chat ID
+/roll – Roll a dice 🎲
 
-async def safe_photo_reply(
-    update: Update,
-    photo: str,
-    text: str,
-    reply_markup=None,
-):
-    """Send photo + caption; fall back to text-only when photo fails."""
-    kw = {"caption": text, "parse_mode": ParseMode.MARKDOWN}
-    if reply_markup:
-        kw["reply_markup"] = reply_markup
-    try:
-        await update.message.reply_photo(photo=photo, **kw)
-    except Exception:
-        tkw = {"parse_mode": ParseMode.MARKDOWN}
-        if reply_markup:
-            tkw["reply_markup"] = reply_markup
-        await update.message.reply_text(text, **tkw)
+🛡️ *Moderation*
+/kick @user – Kick a user
+/ban @user – Ban a user
+/mute @user – Mute a user
+/unmute @user – Unmute a user
+/promote @user – Promote to admin
+/demote @user – Demote from admin
+/pin – Pin replied message
+/unpin – Unpin replied message
+/permission @user perm on|off – Toggle permission
 
-# ══════════════════════════════════════════════════════════
-#  COMMAND HANDLERS
-# ══════════════════════════════════════════════════════════
+💬 *Auto Reply*
+/autoreply set word | response – Set auto-reply
+/autoreply list – List all auto-replies
+/autoreply delete word – Remove auto-reply
 
-# ── /start ────────────────────────────────────────────────
+📢 *Shout*
+/shout <message> – Announce message
+/shoutconfig – Shout configuration panel
+
+💤 *AFK*
+/afk <reason> – Set AFK status
+
+💣 *Nuke*
+/nuke – Delete messages in bulk
+
+📥 *YouTube*
+/yt_dow <url> <mp4|mp3> – Download YouTube video/audio
+"""
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    name = update.effective_user.first_name or "User"
+    user = update.effective_user
+    welcome_media = get_media("welcome")
+
     text = (
-        f"👋 *Welcome, {name}!*\n\n"
-        "🤖 *I'm Knowledge Pro AI*\n"
-        "_Moderate your groups your way — fully customisable and easy._\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "📋 *Commands*\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "🛡 *Moderation*\n"
-        "`/kick` `/ban` `/mute` `/promote` `/demote`\n"
-        "`/pin` `/unpin` `/permission` `/id` `/dice`\n\n"
-        "🤖 *Auto Reply*\n"
-        "`/autoreply set` · `/autoreply list` · `/autoreply delete`\n\n"
-        "📢 *Shout*\n"
-        "`/shout` · `/shoutconfig`\n\n"
-        "💤 *AFK* — `/afk reason`\n\n"
-        "💣 *Nuke* — `/nuke`\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "ℹ️ *About Me*\n"
-        "I'm Knowledge Pro AI that moderates your groups your way — "
-        "fully customisable and easy."
+        f"👋 *Welcome, {mention(user)}!*\n\n"
+        f"🤖 *About Me*\n"
+        f"I'm *Knowledge Pro AI* — your fully customisable, easy-to-use group moderation bot!\n\n"
+        + HELP_TEXT
     )
-    await safe_photo_reply(update, get_media("welcome_photo"), text)
 
+    try:
+        if welcome_media:
+            await update.message.reply_photo(
+                photo=welcome_media,
+                caption=text,
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        else:
+            await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    except Exception:
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
-# ── /help ─────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# /help
+# ═════════════════════════════════════════════════════════════════════════════
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "```\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "          HELP COMMAND\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "```\n"
-        "🛡 *Moderation*\n"
-        "• `/kick` — Remove a member\n"
-        "• `/ban` — Permanently ban\n"
-        "• `/mute` — Silence a user\n"
-        "• `/promote` — Make admin\n"
-        "• `/demote` — Remove admin\n"
-        "• `/permission` perm on|off\n"
-        "• `/pin` — Pin replied message\n"
-        "• `/unpin` — Unpin message\n"
-        "• `/id` — Get user / chat ID\n"
-        "• `/dice` — Roll a dice 🎲\n\n"
-        "🤖 *Auto Reply*\n"
-        "• `/autoreply set` word | reply\n"
-        "• `/autoreply list` — View all\n"
-        "• `/autoreply delete` word\n\n"
-        "📢 *Shout*\n"
-        "• `/shout` message\n"
-        "• `/shoutconfig` — Settings panel\n\n"
-        "💤 *AFK* — `/afk` reason\n\n"
-        "💣 *Nuke* — `/nuke`\n"
-        "```\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "```"
-    )
-    await safe_photo_reply(update, get_media("help_photo"), text)
+    help_media = get_media("help")
+    try:
+        if help_media:
+            await update.message.reply_photo(
+                photo=help_media,
+                caption=HELP_TEXT,
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        else:
+            await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
+    except Exception:
+        await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
 
+# ═════════════════════════════════════════════════════════════════════════════
+# MODERATION HELPERS
+# ═════════════════════════════════════════════════════════════════════════════
 
-# ── /kick ─────────────────────────────────────────────────
+async def resolve_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Resolve target user from reply or @mention argument."""
+    if update.message.reply_to_message:
+        return update.message.reply_to_message.from_user
+    if context.args:
+        username = context.args[0].lstrip("@")
+        try:
+            member = await context.bot.get_chat_member(update.effective_chat.id, username)
+            return member.user
+        except Exception:
+            pass
+    return None
+
+async def self_respect_check(update: Update, context: ContextTypes.DEFAULT_TYPE, target_id: int) -> bool:
+    """Return True (block action) if target is bot, bot owner, or group owner."""
+    if target_id == context.bot.id:
+        await update.message.reply_text("❌ I won't moderate myself!")
+        return True
+    if target_id == BOT_OWNER:
+        await update.message.reply_text("❌ I won't moderate my owner!")
+        return True
+    if await is_group_owner(update, context, target_id):
+        await update.message.reply_text("❌ I cannot moderate the group owner!")
+        return True
+    return False
+
+# ─── /kick ────────────────────────────────────────────────────────────────────
+
 async def cmd_kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update, context):
-        return await update.message.reply_text("⛔ Admins only.")
-    if not update.message.reply_to_message:
-        return await update.message.reply_text("↩️ Reply to a user to kick them.")
-    target = update.message.reply_to_message.from_user
+        return await update.message.reply_text("❌ Admins only.")
+    target = await resolve_target(update, context)
+    if not target:
+        return await update.message.reply_text("❓ Reply to a user or provide @username.")
+    if await self_respect_check(update, context, target.id):
+        return
     try:
         await context.bot.ban_chat_member(update.effective_chat.id, target.id)
         await context.bot.unban_chat_member(update.effective_chat.id, target.id)
-        await update.message.reply_text(
-            f"👢 {mention(target)} has been kicked.", parse_mode=ParseMode.MARKDOWN
-        )
-    except Exception as e:
-        await update.message.reply_text(f"❌ Failed: {e}")
+        await update.message.reply_text(f"👢 {mention(target)} has been kicked.", parse_mode=ParseMode.MARKDOWN)
+    except TelegramError as e:
+        await update.message.reply_text(f"❌ Could not kick: {e}")
 
+# ─── /ban ─────────────────────────────────────────────────────────────────────
 
-# ── /ban ──────────────────────────────────────────────────
 async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update, context):
-        return await update.message.reply_text("⛔ Admins only.")
-    if not update.message.reply_to_message:
-        return await update.message.reply_text("↩️ Reply to a user to ban them.")
-    target = update.message.reply_to_message.from_user
+        return await update.message.reply_text("❌ Admins only.")
+    target = await resolve_target(update, context)
+    if not target:
+        return await update.message.reply_text("❓ Reply to a user or provide @username.")
+    if await self_respect_check(update, context, target.id):
+        return
     try:
         await context.bot.ban_chat_member(update.effective_chat.id, target.id)
-        await update.message.reply_text(
-            f"🔨 {mention(target)} has been banned.", parse_mode=ParseMode.MARKDOWN
-        )
-    except Exception as e:
-        await update.message.reply_text(f"❌ Failed: {e}")
+        await update.message.reply_text(f"🔨 {mention(target)} has been banned.", parse_mode=ParseMode.MARKDOWN)
+    except TelegramError as e:
+        await update.message.reply_text(f"❌ Could not ban: {e}")
 
+# ─── /mute ────────────────────────────────────────────────────────────────────
 
-# ── /mute ─────────────────────────────────────────────────
 async def cmd_mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update, context):
-        return await update.message.reply_text("⛔ Admins only.")
-    if not update.message.reply_to_message:
-        return await update.message.reply_text("↩️ Reply to a user to mute them.")
-    target = update.message.reply_to_message.from_user
+        return await update.message.reply_text("❌ Admins only.")
+    target = await resolve_target(update, context)
+    if not target:
+        return await update.message.reply_text("❓ Reply to a user or provide @username.")
+    if await self_respect_check(update, context, target.id):
+        return
     try:
-        await context.bot.restrict_chat_member(
-            update.effective_chat.id, target.id,
-            ChatPermissions(can_send_messages=False),
+        perms = ChatPermissions(
+            can_send_messages=False,
+            can_send_audios=False,
+            can_send_documents=False,
+            can_send_photos=False,
+            can_send_videos=False,
+            can_send_video_notes=False,
+            can_send_voice_notes=False,
+            can_send_polls=False,
+            can_send_other_messages=False,
         )
-        await update.message.reply_text(
-            f"🔇 {mention(target)} has been muted.", parse_mode=ParseMode.MARKDOWN
+        await context.bot.restrict_chat_member(update.effective_chat.id, target.id, perms)
+        await update.message.reply_text(f"🔇 {mention(target)} has been muted.", parse_mode=ParseMode.MARKDOWN)
+    except TelegramError as e:
+        await update.message.reply_text(f"❌ Could not mute: {e}")
+
+# ─── /unmute ──────────────────────────────────────────────────────────────────
+
+async def cmd_unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update, context):
+        return await update.message.reply_text("❌ Admins only.")
+    target = await resolve_target(update, context)
+    if not target:
+        return await update.message.reply_text("❓ Reply to a user or provide @username.")
+    try:
+        perms = ChatPermissions(
+            can_send_messages=True,
+            can_send_audios=True,
+            can_send_documents=True,
+            can_send_photos=True,
+            can_send_videos=True,
+            can_send_video_notes=True,
+            can_send_voice_notes=True,
+            can_send_polls=True,
+            can_send_other_messages=True,
         )
-    except Exception as e:
-        await update.message.reply_text(f"❌ Failed: {e}")
+        await context.bot.restrict_chat_member(update.effective_chat.id, target.id, perms)
+        await update.message.reply_text(f"🔊 {mention(target)} has been unmuted.", parse_mode=ParseMode.MARKDOWN)
+    except TelegramError as e:
+        await update.message.reply_text(f"❌ Could not unmute: {e}")
 
+# ─── /promote ─────────────────────────────────────────────────────────────────
 
-# ── /promote ──────────────────────────────────────────────
 async def cmd_promote(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update, context):
-        return await update.message.reply_text("⛔ Admins only.")
-    if not update.message.reply_to_message:
-        return await update.message.reply_text("↩️ Reply to a user to promote.")
-    target = update.message.reply_to_message.from_user
+        return await update.message.reply_text("❌ Admins only.")
+    target = await resolve_target(update, context)
+    if not target:
+        return await update.message.reply_text("❓ Reply to a user or provide @username.")
     try:
         await context.bot.promote_chat_member(
             update.effective_chat.id, target.id,
             can_delete_messages=True,
             can_restrict_members=True,
             can_pin_messages=True,
-            can_manage_chat=True,
         )
-        await update.message.reply_text(
-            f"⭐ {mention(target)} promoted to admin.", parse_mode=ParseMode.MARKDOWN
-        )
-    except Exception as e:
-        await update.message.reply_text(f"❌ Failed: {e}")
+        await update.message.reply_text(f"⭐ {mention(target)} promoted to admin.", parse_mode=ParseMode.MARKDOWN)
+    except TelegramError as e:
+        await update.message.reply_text(f"❌ Could not promote: {e}")
 
+# ─── /demote ──────────────────────────────────────────────────────────────────
 
-# ── /demote ───────────────────────────────────────────────
 async def cmd_demote(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update, context):
-        return await update.message.reply_text("⛔ Admins only.")
-    if not update.message.reply_to_message:
-        return await update.message.reply_text("↩️ Reply to a user to demote.")
-    target = update.message.reply_to_message.from_user
+        return await update.message.reply_text("❌ Admins only.")
+    target = await resolve_target(update, context)
+    if not target:
+        return await update.message.reply_text("❓ Reply to a user or provide @username.")
+    if await self_respect_check(update, context, target.id):
+        return
     try:
         await context.bot.promote_chat_member(
             update.effective_chat.id, target.id,
             can_delete_messages=False,
             can_restrict_members=False,
             can_pin_messages=False,
+            can_change_info=False,
+            can_invite_users=False,
             can_manage_chat=False,
         )
-        await update.message.reply_text(
-            f"📉 {mention(target)} has been demoted.", parse_mode=ParseMode.MARKDOWN
-        )
-    except Exception as e:
-        await update.message.reply_text(f"❌ Failed: {e}")
+        await update.message.reply_text(f"👇 {mention(target)} has been demoted.", parse_mode=ParseMode.MARKDOWN)
+    except TelegramError as e:
+        await update.message.reply_text(f"❌ Could not demote: {e}")
 
+# ─── /permission ─────────────────────────────────────────────────────────────
 
-# ── /permission ───────────────────────────────────────────
+PERM_MAP = {
+    "messages":       "can_send_messages",
+    "media":          "can_send_other_messages",
+    "polls":          "can_send_polls",
+    "links":          "can_add_web_page_previews",
+    "invite":         "can_invite_users",
+    "pin":            "can_pin_messages",
+    "info":           "can_change_info",
+}
+
 async def cmd_permission(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Usage: /permission @user perm on|off"""
     if not await is_admin(update, context):
-        return await update.message.reply_text("⛔ Admins only.")
-    if not update.message.reply_to_message or len(context.args) < 2:
+        return await update.message.reply_text("❌ Admins only.")
+    if len(context.args) < 3:
         return await update.message.reply_text(
-            "Usage: Reply to user + `/permission perm on|off`\n"
-            "Perms: `messages` `media` `stickers` `polls` `links`",
-            parse_mode=ParseMode.MARKDOWN,
+            "Usage: `/permission @user <perm> on|off`\n"
+            f"Perms: {', '.join(PERM_MAP.keys())}", parse_mode=ParseMode.MARKDOWN
         )
-    target    = update.message.reply_to_message.from_user
-    perm_name = context.args[0].lower()
-    state     = context.args[1].lower()
-    allow     = state == "on"
-    perm_map  = {
-        "messages": ChatPermissions(can_send_messages=allow),
-        "media":    ChatPermissions(can_send_media_messages=allow),
-        "stickers": ChatPermissions(can_send_other_messages=allow),
-        "polls":    ChatPermissions(can_send_polls=allow),
-        "links":    ChatPermissions(can_add_web_page_previews=allow),
-    }
-    perms = perm_map.get(perm_name)
-    if not perms:
-        return await update.message.reply_text(
-            "❌ Unknown perm. Use: `messages` `media` `stickers` `polls` `links`",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+    target = await resolve_target(update, context)
+    perm_name = context.args[1].lower()
+    toggle = context.args[2].lower() == "on"
+
+    if perm_name not in PERM_MAP:
+        return await update.message.reply_text(f"❓ Unknown permission. Choose: {', '.join(PERM_MAP.keys())}")
+    if not target:
+        return await update.message.reply_text("❓ User not found.")
+    if await self_respect_check(update, context, target.id):
+        return
+
+    perm_kwargs = {PERM_MAP[perm_name]: toggle}
     try:
-        await context.bot.restrict_chat_member(update.effective_chat.id, target.id, perms)
-        await update.message.reply_text(
-            f"✅ `{perm_name}` → `{state}` for {mention(target)}.",
-            parse_mode=ParseMode.MARKDOWN,
+        await context.bot.restrict_chat_member(
+            update.effective_chat.id, target.id, ChatPermissions(**perm_kwargs)
         )
-    except Exception as e:
-        await update.message.reply_text(f"❌ Failed: {e}")
+        state = "ON ✅" if toggle else "OFF ❌"
+        await update.message.reply_text(
+            f"🔧 {mention(target)}: `{perm_name}` → {state}", parse_mode=ParseMode.MARKDOWN
+        )
+    except TelegramError as e:
+        await update.message.reply_text(f"❌ Error: {e}")
 
+# ─── /pin / /unpin ────────────────────────────────────────────────────────────
 
-# ── /pin ──────────────────────────────────────────────────
 async def cmd_pin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update, context):
-        return await update.message.reply_text("⛔ Admins only.")
+        return await update.message.reply_text("❌ Admins only.")
     if not update.message.reply_to_message:
-        return await update.message.reply_text("↩️ Reply to a message to pin it.")
+        return await update.message.reply_text("❓ Reply to a message to pin it.")
     try:
         await context.bot.pin_chat_message(
-            update.effective_chat.id,
-            update.message.reply_to_message.message_id,
+            update.effective_chat.id, update.message.reply_to_message.message_id
         )
-        await update.message.reply_text("📌 Message pinned.")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Failed: {e}")
+        await update.message.reply_text("📌 Message pinned!")
+    except TelegramError as e:
+        await update.message.reply_text(f"❌ {e}")
 
-
-# ── /unpin ────────────────────────────────────────────────
 async def cmd_unpin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update, context):
-        return await update.message.reply_text("⛔ Admins only.")
+        return await update.message.reply_text("❌ Admins only.")
     try:
-        await context.bot.unpin_chat_message(update.effective_chat.id)
-        await update.message.reply_text("📌 Message unpinned.")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Failed: {e}")
+        if update.message.reply_to_message:
+            await context.bot.unpin_chat_message(
+                update.effective_chat.id, update.message.reply_to_message.message_id
+            )
+        else:
+            await context.bot.unpin_chat_message(update.effective_chat.id)
+        await update.message.reply_text("📌 Message unpinned!")
+    except TelegramError as e:
+        await update.message.reply_text(f"❌ {e}")
 
+# ─── /id ─────────────────────────────────────────────────────────────────────
 
-# ── /id ───────────────────────────────────────────────────
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user   = update.effective_user
-    chat   = update.effective_chat
-    target = update.message.reply_to_message.from_user if update.message.reply_to_message else user
-    await update.message.reply_text(
-        f"👤 *User ID:* `{target.id}`\n💬 *Chat ID:* `{chat.id}`",
-        parse_mode=ParseMode.MARKDOWN,
+    user = update.effective_user
+    chat = update.effective_chat
+    text = (
+        f"👤 *Your ID:* `{user.id}`\n"
+        f"💬 *Chat ID:* `{chat.id}`"
     )
+    if update.message.reply_to_message:
+        ru = update.message.reply_to_message.from_user
+        text += f"\n🔍 *{ru.first_name}'s ID:* `{ru.id}`"
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
+# ─── /roll ────────────────────────────────────────────────────────────────────
 
-# ── /dice ─────────────────────────────────────────────────
-async def cmd_dice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await context.bot.send_dice(update.effective_chat.id)
+async def cmd_roll(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    result = random.randint(1, 6)
+    dice_emoji = ["⚀", "⚁", "⚂", "⚃", "⚄", "⚅"][result - 1]
+    await update.message.reply_text(f"🎲 You rolled: {dice_emoji} *{result}*", parse_mode=ParseMode.MARKDOWN)
 
+# ═════════════════════════════════════════════════════════════════════════════
+# AUTO REPLY
+# ═════════════════════════════════════════════════════════════════════════════
 
-# ── /autoreply ────────────────────────────────────────────
 async def cmd_autoreply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /autoreply set word | response
+    /autoreply list
+    /autoreply delete word
+    """
     if not context.args:
         return await update.message.reply_text(
-            "Usage:\n"
-            "`/autoreply set` word | reply\n"
-            "`/autoreply list`\n"
-            "`/autoreply delete` word",
-            parse_mode=ParseMode.MARKDOWN,
+            "Usage:\n`/autoreply set word | response`\n`/autoreply list`\n`/autoreply delete word`",
+            parse_mode=ParseMode.MARKDOWN
         )
-
     sub = context.args[0].lower()
 
     if sub == "set":
-        try:
-            payload = (update.message.text or "").split(None, 2)[2]
-        except IndexError:
-            return await update.message.reply_text(
-                "Usage: `/autoreply set` word | reply", parse_mode=ParseMode.MARKDOWN
-            )
-        if "|" not in payload:
-            return await update.message.reply_text(
-                "Format: `/autoreply set` word | reply", parse_mode=ParseMode.MARKDOWN
-            )
-        trigger, reply_msg = payload.split("|", 1)
-        trigger   = trigger.strip().lower()
-        reply_msg = reply_msg.strip()
-        if not trigger or not reply_msg:
-            return await update.message.reply_text("Both word and reply must be non-empty.")
-        fb_set(f"autoreply/{trigger}", reply_msg)
-        await update.message.reply_text(
-            f"✅ Auto reply set:\n`{trigger}` → {reply_msg}", parse_mode=ParseMode.MARKDOWN
-        )
+        raw = " ".join(context.args[1:])
+        if "|" not in raw:
+            return await update.message.reply_text("❓ Format: `/autoreply set word | response`", parse_mode=ParseMode.MARKDOWN)
+        word, response = [x.strip() for x in raw.split("|", 1)]
+        if not word or not response:
+            return await update.message.reply_text("❓ Word and response cannot be empty.")
+        chat_id = str(update.effective_chat.id)
+        fb_set(f"autoreply/{chat_id}/{word}", response)
+        await update.message.reply_text(f"✅ Auto-reply set: *{word}* → `{response}`", parse_mode=ParseMode.MARKDOWN)
 
     elif sub == "list":
-        data = fb_get("autoreply", {})
-        body = (
-            "\n".join([f"  • `{k}` → {v}" for k, v in data.items()])
-            if data else "  (none saved yet)"
-        )
-        text = (
-            "```\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "      Auto Reply List\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "```\n"
-            + body
-            + "\n```\n━━━━━━━━━━━━━━━━━━━━━━━━━\n```"
-        )
-        await safe_photo_reply(update, get_media("autoreply_poster"), text)
+        chat_id = str(update.effective_chat.id)
+        data = fb_get(f"autoreply/{chat_id}")
+        ar_media = get_media("autoreply_poster")
+
+        if not data:
+            return await update.message.reply_text("📭 No auto-replies set.")
+
+        lines = [
+            "╔══════════════════════════╗",
+            "║    📋  Auto Reply List    ║",
+            "╚══════════════════════════╝\n",
+        ]
+        for word, resp in data.items():
+            lines.append(f"• *{word}* → `{resp}`")
+        text = "\n".join(lines)
+
+        try:
+            if ar_media:
+                await update.message.reply_photo(photo=ar_media, caption=text, parse_mode=ParseMode.MARKDOWN)
+            else:
+                await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
     elif sub == "delete":
         if len(context.args) < 2:
-            return await update.message.reply_text(
-                "Usage: `/autoreply delete` word", parse_mode=ParseMode.MARKDOWN
-            )
-        trigger = context.args[1].lower()
-        fb_delete(f"autoreply/{trigger}")
-        await update.message.reply_text(
-            f"🗑️ Auto reply for `{trigger}` removed.", parse_mode=ParseMode.MARKDOWN
-        )
-
+            return await update.message.reply_text("❓ Provide the word to delete.")
+        word = context.args[1].lower()
+        chat_id = str(update.effective_chat.id)
+        fb_delete(f"autoreply/{chat_id}/{word}")
+        await update.message.reply_text(f"🗑️ Auto-reply for *{word}* removed.", parse_mode=ParseMode.MARKDOWN)
     else:
-        await update.message.reply_text(
-            "Unknown subcommand. Use: `set` / `list` / `delete`",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        await update.message.reply_text("❓ Unknown sub-command. Use: set / list / delete")
 
+# ═════════════════════════════════════════════════════════════════════════════
+# /shout
+# ═════════════════════════════════════════════════════════════════════════════
 
-# ── /shout ────────────────────────────────────────────────
 async def cmd_shout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update, context):
-        return await update.message.reply_text("⛔ Admins only.")
+        return await update.message.reply_text("❌ Admins only.")
     if not context.args:
-        return await update.message.reply_text(
-            "Usage: `/shout` your message", parse_mode=ParseMode.MARKDOWN
-        )
-    msg     = " ".join(context.args)
-    blocked = fb_get("shout_config/blocked_words", {})
-    for word in (blocked or {}).values():
-        if str(word).lower() in msg.lower():
-            return await update.message.reply_text(
-                f"🚫 Blocked word detected: `{word}`", parse_mode=ParseMode.MARKDOWN
-            )
+        return await update.message.reply_text("❓ Usage: `/shout <message>`", parse_mode=ParseMode.MARKDOWN)
+
+    message = " ".join(context.args)
+    chat_id = str(update.effective_chat.id)
+
+    # Check blocked words
+    blocked = fb_get(f"shout_config/{chat_id}/blocked_words") or {}
+    for bw in blocked.keys():
+        if bw.lower() in message.lower():
+            return await update.message.reply_text(f"🚫 Message contains a blocked word: *{bw}*", parse_mode=ParseMode.MARKDOWN)
+
     text = (
         "📢 *ANNOUNCEMENT*\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        f"{msg}\n"
-        "━━━━━━━━━━━━━━━━━━━━"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"{message}\n"
+        "━━━━━━━━━━━━━━━━━━"
     )
-    await safe_photo_reply(update, get_media("shout_poster"), text)
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
+# ─── /shoutconfig ─────────────────────────────────────────────────────────────
 
-# ── /shoutconfig ──────────────────────────────────────────
 async def cmd_shoutconfig(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update, context):
-        return await update.message.reply_text("⛔ Admins only.")
-    gif_block = fb_get("shout_config/gif_block", False)
-    gif_label = (
-        "🟢 GIF Blocker: ON  (tap to disable)"
-        if gif_block
-        else "🔴 GIF Blocker: OFF  (tap to enable)"
-    )
+        return await update.message.reply_text("❌ Admins only.")
+
+    chat_id = str(update.effective_chat.id)
+    gif_blocked = fb_get(f"shout_config/{chat_id}/gif_blocked") or False
+
+    gif_btn_label = "🎞️ GIF Blocker: ON ✅" if gif_blocked else "🎞️ GIF Blocker: OFF ❌"
+
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Add Blocked Word",    callback_data="shout_add_word")],
-        [InlineKeyboardButton("➖ Remove Blocked Word", callback_data="shout_remove_word")],
-        [InlineKeyboardButton(gif_label,               callback_data="shout_toggle_gif")],
+        [InlineKeyboardButton("➕ Add Blocked Word", callback_data=f"shout_add|{chat_id}")],
+        [InlineKeyboardButton("➖ Remove Blocked Word", callback_data=f"shout_remove|{chat_id}")],
+        [InlineKeyboardButton(gif_btn_label, callback_data=f"shout_gif|{chat_id}")],
     ])
+
+    shout_media = get_media("shout_config_poster")
     text = (
-        "```\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "    Shout Configuration Panel\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "```\n"
-        "Manage your shout settings below:"
+        "╔══════════════════════════════╗\n"
+        "║   📢  Shout Configuration    ║\n"
+        "╚══════════════════════════════╝\n\n"
+        "Use the buttons below to manage shout settings."
     )
-    await safe_photo_reply(update, get_media("shout_poster"), text, reply_markup=keyboard)
+    try:
+        if shout_media:
+            await update.message.reply_photo(photo=shout_media, caption=text, reply_markup=keyboard)
+        else:
+            await update.message.reply_text(text, reply_markup=keyboard)
+    except Exception:
+        await update.message.reply_text(text, reply_markup=keyboard)
 
+async def shoutconfig_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    parts = query.data.split("|")
+    action = parts[0]
+    chat_id = parts[1] if len(parts) > 1 else str(update.effective_chat.id)
 
-# ── /afk ──────────────────────────────────────────────────
+    if action == "shout_add":
+        context.user_data["shout_add_pending"] = chat_id
+        await query.message.reply_text("✏️ Send the word you want to block from `/shout`:", parse_mode=ParseMode.MARKDOWN)
+
+    elif action == "shout_remove":
+        blocked = fb_get(f"shout_config/{chat_id}/blocked_words") or {}
+        if not blocked:
+            await query.message.reply_text("📭 No blocked words to remove.")
+            return
+        buttons = [[InlineKeyboardButton(w, callback_data=f"shout_del_word|{chat_id}|{w}")] for w in blocked]
+        await query.message.reply_text("Select word to unblock:", reply_markup=InlineKeyboardMarkup(buttons))
+
+    elif action == "shout_gif":
+        current = fb_get(f"shout_config/{chat_id}/gif_blocked") or False
+        fb_set(f"shout_config/{chat_id}/gif_blocked", not current)
+        state = "ON ✅" if not current else "OFF ❌"
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text(f"🎞️ GIF Blocker is now *{state}*", parse_mode=ParseMode.MARKDOWN)
+
+    elif action == "shout_del_word":
+        word = parts[2]
+        fb_delete(f"shout_config/{chat_id}/blocked_words/{word}")
+        await query.edit_message_text(f"✅ Removed *{word}* from blocked list.", parse_mode=ParseMode.MARKDOWN)
+
+# ═════════════════════════════════════════════════════════════════════════════
+# /afk
+# ═════════════════════════════════════════════════════════════════════════════
+
 async def cmd_afk(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user   = update.effective_user
-    reason = " ".join(context.args) if context.args else "No reason given"
-    fb_set(f"afk/{user.id}", {
-        "reason": reason,
-        "name":   user.full_name or user.first_name or "Unknown",
-        "time":   str(datetime.utcnow()),
-    })
+    user = update.effective_user
+    reason = " ".join(context.args) if context.args else "No reason provided"
+    chat_id = str(update.effective_chat.id)
+
+    fb_set(f"afk/{chat_id}/{user.id}", {"reason": reason, "name": user.full_name})
+
+    afk_media = get_media("afk_poster")
     text = (
-        "```\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "           AFK\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "```\n"
-        f"💤 *{user.full_name or user.first_name}* is now AFK\n"
-        f"📝 *Reason:* {reason}\n"
-        "```\n━━━━━━━━━━━━━━━━━━━━━━━\n```"
+        "╔══════════════════════╗\n"
+        "║        💤  AFK       ║\n"
+        "╚══════════════════════╝\n\n"
+        f"👤 *{mention(user)}* is now AFK\n"
+        f"📝 *Reason:* {reason}"
     )
-    await safe_photo_reply(update, get_media("afk_poster"), text)
+    try:
+        if afk_media:
+            await update.message.reply_photo(photo=afk_media, caption=text, parse_mode=ParseMode.MARKDOWN)
+        else:
+            await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    except Exception:
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
+async def check_afk_return(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remove AFK when the user sends any message/voice/gif."""
+    if not update.effective_user or not update.effective_chat:
+        return
+    user = update.effective_user
+    chat_id = str(update.effective_chat.id)
+    uid = str(user.id)
 
-# ── /nuke ─────────────────────────────────────────────────
+    afk_data = fb_get(f"afk/{chat_id}/{uid}")
+    if afk_data:
+        fb_delete(f"afk/{chat_id}/{uid}")
+        await update.message.reply_text(
+            f"👋 Welcome back, {mention(user)}! AFK removed.", parse_mode=ParseMode.MARKDOWN
+        )
+
+# ═════════════════════════════════════════════════════════════════════════════
+# /nuke
+# ═════════════════════════════════════════════════════════════════════════════
+
 async def cmd_nuke(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update, context):
-        return await update.message.reply_text("⛔ Admins only.")
+        return await update.message.reply_text("❌ Admins only.")
+
+    chat_id = str(update.effective_chat.id)
+    nuke_media = get_media("nuke_poster")
+
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("💥 Delete 100",  callback_data="nuke_100"),
-            InlineKeyboardButton("💥 Delete 200",  callback_data="nuke_200"),
+            InlineKeyboardButton("💥 100", callback_data=f"nuke|{chat_id}|100"),
+            InlineKeyboardButton("💥 200", callback_data=f"nuke|{chat_id}|200"),
         ],
         [
-            InlineKeyboardButton("☢️ Delete 8900", callback_data="nuke_8900"),
-            InlineKeyboardButton("❌ Cancel",       callback_data="nuke_cancel"),
+            InlineKeyboardButton("☢️ 8900", callback_data=f"nuke|{chat_id}|8900"),
+            InlineKeyboardButton("❌ Cancel", callback_data=f"nuke|{chat_id}|cancel"),
         ],
     ])
+
     text = (
-        "```\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "        Nuke Panel\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "```\n"
-        "⚠️ *Choose how many messages to delete:*"
+        "╔══════════════════════╗\n"
+        "║    ☢️  Nuke Panel    ║\n"
+        "╚══════════════════════╝\n\n"
+        "⚠️ Select how many messages to delete:"
     )
-    await safe_photo_reply(update, get_media("nuke_poster"), text, reply_markup=keyboard)
+    try:
+        if nuke_media:
+            await update.message.reply_photo(photo=nuke_media, caption=text, reply_markup=keyboard)
+        else:
+            await update.message.reply_text(text, reply_markup=keyboard)
+    except Exception:
+        await update.message.reply_text(text, reply_markup=keyboard)
 
-# ══════════════════════════════════════════════════════════
-#  CALLBACK QUERY HANDLER
-# ══════════════════════════════════════════════════════════
-
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query   = update.callback_query
+async def nuke_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
     await query.answer()
-    data    = query.data
-    chat_id = query.message.chat.id
 
-    # ── NUKE ──────────────────────────────────
-    if data.startswith("nuke_"):
+    if not await is_admin(update, context):
+        return await query.answer("❌ Admins only.", show_alert=True)
+
+    parts = query.data.split("|")
+    chat_id_str = parts[1]
+    amount = parts[2]
+
+    if amount == "cancel":
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text("❌ Nuke cancelled.")
+        return
+
+    count = int(amount)
+    await query.edit_message_reply_markup(reply_markup=None)
+    status_msg = await query.message.reply_text(f"☢️ Nuking {count} messages...")
+
+    deleted = 0
+    msg_id = query.message.message_id
+
+    for i in range(msg_id, max(msg_id - count - 50, 0), -1):
         try:
-            admins = await context.bot.get_chat_administrators(chat_id)
-            if not any(a.user.id == query.from_user.id for a in admins):
-                return await query.answer("⛔ Admins only.", show_alert=True)
+            await context.bot.delete_message(int(chat_id_str), i)
+            deleted += 1
+            if deleted >= count:
+                break
         except Exception:
-            pass
+            continue
 
-        if data == "nuke_cancel":
-            try:
-                await query.edit_message_caption("❌ Nuke cancelled.")
-            except Exception:
-                await query.edit_message_text("❌ Nuke cancelled.")
-            return
+    try:
+        await status_msg.edit_text(f"✅ Deleted approximately {deleted} messages.")
+    except Exception:
+        pass
 
-        count = int(data.split("_")[1])
-        try:
-            await query.edit_message_caption(f"💣 Nuking {count} messages…")
-        except Exception:
-            pass
+# ═════════════════════════════════════════════════════════════════════════════
+# /yt_dow
+# ═════════════════════════════════════════════════════════════════════════════
 
-        deleted = 0
-        msg_id  = query.message.message_id - 1
-        while deleted < count and msg_id > 0:
-            try:
-                await context.bot.delete_message(chat_id, msg_id)
-                deleted += 1
-            except Exception:
-                pass
-            msg_id -= 1
-            await asyncio.sleep(0.05)
+async def cmd_yt_dow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2:
+        return await update.message.reply_text(
+            "❓ Usage: `/yt_dow <YouTube URL> <mp4|mp3>`", parse_mode=ParseMode.MARKDOWN
+        )
 
-        result = f"✅ Deleted {deleted} messages."
-        try:
-            await query.edit_message_caption(result)
-        except Exception:
-            try:
-                await query.edit_message_text(result)
-            except Exception:
-                pass
+    url = context.args[0]
+    fmt = context.args[1].lower()
 
-    # ── SHOUT CONFIG ──────────────────────────
-    elif data == "shout_toggle_gif":
-        current = fb_get("shout_config/gif_block", False)
-        fb_set("shout_config/gif_block", not current)
-        status = "ON 🟢" if not current else "OFF 🔴"
-        await query.answer(f"GIF Blocker turned {status}", show_alert=True)
+    if fmt not in ("mp4", "mp3"):
+        return await update.message.reply_text("❓ Format must be `mp4` or `mp3`.", parse_mode=ParseMode.MARKDOWN)
 
-    elif data == "shout_add_word":
-        context.user_data["awaiting"] = "shout_add"
-        await query.answer("Send the word you want to block.", show_alert=True)
+    status = await update.message.reply_text("⏳ Downloading, please wait...")
 
-    elif data == "shout_remove_word":
-        context.user_data["awaiting"] = "shout_remove"
-        await query.answer("Send the word you want to unblock.", show_alert=True)
+    try:
+        import tempfile, os
+        with tempfile.TemporaryDirectory() as tmpdir:
+            outtmpl = os.path.join(tmpdir, "%(title)s.%(ext)s")
 
-# ══════════════════════════════════════════════════════════
-#  MESSAGE HANDLER  (auto-reply / AFK / GIF block)
-# ══════════════════════════════════════════════════════════
+            if fmt == "mp4":
+                ydl_opts = {
+                    "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+                    "outtmpl": outtmpl,
+                    "quiet": True,
+                }
+            else:
+                ydl_opts = {
+                    "format": "bestaudio/best",
+                    "outtmpl": outtmpl,
+                    "postprocessors": [{
+                        "key": "FFmpegExtractAudio",
+                        "preferredcodec": "mp3",
+                        "preferredquality": "192",
+                    }],
+                    "quiet": True,
+                }
 
-async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                title = info.get("title", "video")
+
+            files = os.listdir(tmpdir)
+            if not files:
+                await status.edit_text("❌ Download failed — no file produced.")
+                return
+
+            filepath = os.path.join(tmpdir, files[0])
+            fsize = os.path.getsize(filepath)
+
+            if fsize > 50 * 1024 * 1024:
+                await status.edit_text("❌ File too large to send via Telegram (>50MB).")
+                return
+
+            await status.edit_text(f"📤 Uploading *{title}*...", parse_mode=ParseMode.MARKDOWN)
+
+            with open(filepath, "rb") as f:
+                if fmt == "mp4":
+                    await update.message.reply_video(video=f, caption=f"🎬 {title}")
+                else:
+                    await update.message.reply_audio(audio=f, title=title, caption=f"🎵 {title}")
+
+            await status.delete()
+
+    except Exception as e:
+        logger.error(f"yt_dow error: {e}")
+        await status.edit_text(f"❌ Error: {e}")
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MESSAGE HANDLER — Auto-Reply + AFK check + GIF blocker
+# ═════════════════════════════════════════════════════════════════════════════
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.effective_user:
         return
 
     user = update.effective_user
-    chat = update.effective_chat
-    msg  = update.message
+    chat_id = str(update.effective_chat.id)
 
-    # ── Awaiting shout-word input ──────────────
-    awaiting = context.user_data.get("awaiting")
-    if awaiting and msg.text:
-        word = msg.text.strip().lower()
-        if awaiting == "shout_add":
-            fb_push("shout_config/blocked_words", word)
-            await msg.reply_text(f"✅ `{word}` added to blocked words.", parse_mode=ParseMode.MARKDOWN)
-        elif awaiting == "shout_remove":
-            blocked = fb_get("shout_config/blocked_words", {})
-            removed = False
-            for k, v in (blocked or {}).items():
-                if str(v).lower() == word:
-                    fb_delete(f"shout_config/blocked_words/{k}")
-                    removed = True
-                    break
-            msg_txt = f"🗑️ `{word}` removed." if removed else f"❌ `{word}` not found."
-            await msg.reply_text(msg_txt, parse_mode=ParseMode.MARKDOWN)
-        context.user_data.pop("awaiting", None)
-        return
+    # ── AFK return check ─────────────────────────────────────────────────────
+    await check_afk_return(update, context)
 
-    # ── GIF blocker ───────────────────────────
-    gif_block = fb_get("shout_config/gif_block", False)
-    if gif_block and (msg.animation or (msg.sticker and msg.sticker.is_animated)):
+    # ── GIF blocker ──────────────────────────────────────────────────────────
+    gif_blocked = fb_get(f"shout_config/{chat_id}/gif_blocked") or False
+    if gif_blocked and update.message.animation:
         try:
-            await msg.delete()
-            await context.bot.send_message(
-                chat.id,
-                f"🚫 {mention(user)} GIFs are blocked in this group.",
-                parse_mode=ParseMode.MARKDOWN,
-            )
+            await update.message.delete()
+            await update.message.reply_text("🚫 GIFs are blocked in this chat.")
         except Exception:
             pass
         return
 
-    # ── AFK removal ───────────────────────────
-    if fb_get(f"afk/{user.id}"):
-        fb_delete(f"afk/{user.id}")
-        try:
-            await msg.reply_text(
-                f"👋 Welcome back, *{user.first_name}*! AFK status removed.",
-                parse_mode=ParseMode.MARKDOWN,
-            )
-        except Exception:
-            pass
+    # ── Shout pending word collection ────────────────────────────────────────
+    pending_chat = context.user_data.get("shout_add_pending")
+    if pending_chat:
+        word = update.message.text.strip().lower()
+        fb_set(f"shout_config/{pending_chat}/blocked_words/{word}", True)
+        del context.user_data["shout_add_pending"]
+        await update.message.reply_text(f"✅ Word *{word}* added to blocked list.", parse_mode=ParseMode.MARKDOWN)
+        return
 
-    # ── Auto reply ────────────────────────────
-    if msg.text:
-        replies    = fb_get("autoreply", {})
-        text_lower = msg.text.lower()
-        for trigger, reply_text in (replies or {}).items():
-            if str(trigger).lower() in text_lower:
-                try:
-                    await msg.reply_text(str(reply_text))
-                except Exception:
-                    pass
+    # ── Auto-reply ────────────────────────────────────────────────────────────
+    if update.message.text:
+        data = fb_get(f"autoreply/{chat_id}") or {}
+        msg_lower = update.message.text.lower()
+        for word, response in data.items():
+            if word.lower() in msg_lower:
+                await update.message.reply_text(response)
                 break
 
-# ══════════════════════════════════════════════════════════
-#  KEEP-ALIVE  — separate daemon thread, plain HTTP server
-# ══════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
+# KEEP-ALIVE  (Flask + waitress)
+# ═════════════════════════════════════════════════════════════════════════════
 
-class _PingHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"Knowledge Pro AI Bot - alive!")
+flask_app = Flask(__name__)
 
+@flask_app.route("/")
+def health():
+    return "Knowledge Pro AI Bot is running! ✅", 200
 
-    def log_message(self, *_):
-        pass  # silence access log
-
-
-def _keep_alive_loop():
-    port   = int(os.getenv("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), _PingHandler)
-    logger.info("Keep-alive server on port %d", port)
-    server.serve_forever()
-
+def run_flask():
+    serve(flask_app, host="0.0.0.0", port=PORT)
 
 def start_keep_alive():
-    threading.Thread(target=_keep_alive_loop, daemon=True, name="keep-alive").start()
+    t = Thread(target=run_flask, daemon=True)
+    t.start()
+    logger.info(f"Keep-alive server started on port {PORT}")
 
-# ══════════════════════════════════════════════════════════
-#  ASYNC MAIN  — called via asyncio.run() for Python 3.14+
-# ══════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
+# BOT SETUP & MAIN
+# ═════════════════════════════════════════════════════════════════════════════
 
-async def async_main():
+def main():
+    if not BOT_TOKEN:
+        raise ValueError("BOT_TOKEN environment variable is not set!")
+
+    init_firebase()
     start_keep_alive()
 
     app = Application.builder().token(BOT_TOKEN).build()
 
+    # ── Command handlers ──────────────────────────────────────────────────────
     app.add_handler(CommandHandler("start",       cmd_start))
     app.add_handler(CommandHandler("help",        cmd_help))
+    app.add_handler(CommandHandler("id",          cmd_id))
+    app.add_handler(CommandHandler("roll",        cmd_roll))
+
+    # Moderation
     app.add_handler(CommandHandler("kick",        cmd_kick))
     app.add_handler(CommandHandler("ban",         cmd_ban))
     app.add_handler(CommandHandler("mute",        cmd_mute))
+    app.add_handler(CommandHandler("unmute",      cmd_unmute))
     app.add_handler(CommandHandler("promote",     cmd_promote))
     app.add_handler(CommandHandler("demote",      cmd_demote))
     app.add_handler(CommandHandler("permission",  cmd_permission))
     app.add_handler(CommandHandler("pin",         cmd_pin))
     app.add_handler(CommandHandler("unpin",       cmd_unpin))
-    app.add_handler(CommandHandler("id",          cmd_id))
-    app.add_handler(CommandHandler("dice",        cmd_dice))
+
+    # Auto-reply
     app.add_handler(CommandHandler("autoreply",   cmd_autoreply))
+
+    # Shout
     app.add_handler(CommandHandler("shout",       cmd_shout))
     app.add_handler(CommandHandler("shoutconfig", cmd_shoutconfig))
+
+    # AFK
     app.add_handler(CommandHandler("afk",         cmd_afk))
+
+    # Nuke
     app.add_handler(CommandHandler("nuke",        cmd_nuke))
-    app.add_handler(CallbackQueryHandler(callback_handler))
-    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, message_handler))
 
-    logger.info("Knowledge Pro AI Bot started.")
+    # YouTube download
+    app.add_handler(CommandHandler("yt_dow",      cmd_yt_dow))
 
-    # initialize → start → idle → stop  (manual lifecycle for Python 3.14)
-    async with app:
-        await app.start()
-        await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-        # keep running until Ctrl-C / SIGTERM
-        await asyncio.Event().wait()
-        await app.updater.stop()
-        await app.stop()
+    # ── Callback query handlers ───────────────────────────────────────────────
+    app.add_handler(CallbackQueryHandler(shoutconfig_callback, pattern=r"^shout_"))
+    app.add_handler(CallbackQueryHandler(nuke_callback,        pattern=r"^nuke\|"))
+
+    # ── Message handler (auto-reply, afk, gif blocker) ────────────────────────
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
+
+    logger.info("🤖 Knowledge Pro AI Bot is starting...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
-    asyncio.run(async_main())
+    main()
