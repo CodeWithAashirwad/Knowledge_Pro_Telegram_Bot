@@ -1709,6 +1709,9 @@ bot.catch((err, ctx) => {
 bot.launch().then(() => {
   console.log('✅ Bot is up and running (polling mode)');
 });
-
+const express = require('express');
+const app = express();
+app.get('/health', (req, res) => res.send('OK'));
+app.listen(process.env.PORT || 3000);
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
