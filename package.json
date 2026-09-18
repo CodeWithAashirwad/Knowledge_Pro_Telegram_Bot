@@ -1,0 +1,20 @@
+{
+  "name": "telegram-admin-bot",
+  "version": "1.0.0",
+  "description": "Professional Telegram group management bot (Node.js + Supabase + OpenRouter AI)",
+  "main": "bot.js",
+  "type": "commonjs",
+   "scripts": {
+    "build": "yarn install",
+    "start": "node index.js"
+     },
+  
+  "dependencies": {
+    "telegraf": "^4.16.3",
+    "@supabase/supabase-js": "^2.45.4",
+    "dotenv": "^16.4.5"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
