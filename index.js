@@ -513,29 +513,54 @@ stay organized (short paragraphs or steps) — never ramble.`,
 };
 
 // -------------------------------------------------------------------------
-// AI ACTION LAYER (Jarvis-style limited command execution) — kept fully
-// separate from the AI_PERSONAS text above, so no persona is edited.
+// AI ACTION LAYER (Jarvis-style command execution) — kept fully separate
+// from the AI_PERSONAS text above, so no persona is edited.
+// Full whitelist mirrors the bot's existing admin slash-commands — the AI
+// gets no capability an admin didn't already have via /kick, /ban, etc.
 // -------------------------------------------------------------------------
-const ALLOWED_AI_ACTIONS = ['set_title', 'set_description', 'pin_last', 'unpin_last'];
+const ALLOWED_AI_ACTIONS = [
+  'set_title', 'set_description', 'pin_last', 'unpin_last',
+  'kick_user', 'ban_user', 'mute_user', 'unmute_user', 'warn_user',
+  'promote_user', 'demote_user', 'add_blockword', 'remove_blockword',
+];
 
-const AI_ACTION_SYSTEM = `You can optionally trigger a small, fixed set of group admin actions,
-but ONLY when the user is clearly instructing you to do that specific thing (not just talking
-about it). You must always answer with a single strict JSON object, nothing else — no markdown
-fences, no extra text before or after it.
+// User-targeted actions always require the admin to reply to the target's
+// message when asking the AI — the AI cannot reliably resolve @usernames
+// to a Telegram user id, same limitation the slash-commands have.
+const USER_TARGET_ACTIONS = new Set([
+  'kick_user', 'ban_user', 'mute_user', 'unmute_user', 'warn_user', 'promote_user', 'demote_user',
+]);
+
+const AI_ACTION_SYSTEM = `You act like Jarvis for this Telegram group: you can trigger the same
+admin actions the group's slash-commands already offer, but ONLY when the user is clearly
+instructing you to do that specific thing (not just talking about it). You must always answer
+with a single strict JSON object, nothing else — no markdown fences, no extra text before or
+after it.
 
 Two allowed shapes:
 1) Normal chat: {"type":"chat","reply":"<your in-character reply>"}
-2) Action: {"type":"action","action":"<set_title|set_description|pin_last|unpin_last>","params":{...},"reply":"<short in-character confirmation to show the user>"}
+2) Action: {"type":"action","action":"<one of the allowed actions>","params":{...},"reply":"<short in-character confirmation to show the user>"}
 
-Action params:
-- set_title: {"title": "<new group title, kept under 128 characters>"}
-- set_description: {"description": "<new group description, kept under 255 characters>"}
+Allowed actions and their params:
+- set_title: {"title": "<new group title, under 128 characters>"}
+- set_description: {"description": "<new group description, under 255 characters>"}
 - pin_last: {}   (pins the message the user replied to when asking you)
 - unpin_last: {} (unpins the currently pinned message)
+- kick_user: {"reason": "<why>"}   (acts on whoever the user replied to)
+- ban_user: {"reason": "<why>"}    (acts on whoever the user replied to)
+- mute_user: {"minutes": <number>, "reason": "<why>"}   (acts on whoever the user replied to)
+- unmute_user: {}   (acts on whoever the user replied to)
+- warn_user: {"reason": "<why>"}   (acts on whoever the user replied to)
+- promote_user: {}  (acts on whoever the user replied to)
+- demote_user: {}   (acts on whoever the user replied to)
+- add_blockword: {"word": "<word>", "reason": "<why>", "punishment": "warn|mute|kick|ban"}
+- remove_blockword: {"word": "<word>"}
 
-Never invent an action outside this exact list. If the user is just chatting, asking a question,
-or the request doesn't clearly map to one of these actions, always use "chat" — don't guess an
-action just because a group-related word was mentioned.
+Never invent an action outside this exact list. If the request doesn't clearly map to one of
+these, or the user is just chatting/asking a question, always use "chat" — don't guess an action
+just because a group-related word was mentioned. Any user-targeted action only makes sense if the
+user replied to someone's message when asking you — if they didn't, just explain in "chat" that
+they need to reply to that person's message first.
 
 LANGUAGE: Always detect the language/script the user just wrote their message in (Hindi, Hinglish,
 English, or anything else) and write your "reply" text in that same language — regardless of what
@@ -547,6 +572,12 @@ think it through step by step internally first, then give only your final answer
 never show your step-by-step working to the user.`;
 
 async function executeAiAction(ctx, action, params = {}) {
+  const requireTarget = () => {
+    const target = getTargetUser(ctx);
+    if (!target) throw new Error('Reply to the person\'s message first, then ask me to do this.');
+    return target;
+  };
+
   switch (action) {
     case 'set_title': {
       const title = (params.title || '').trim().slice(0, 128);
@@ -561,9 +592,7 @@ async function executeAiAction(ctx, action, params = {}) {
       return 'Group description update kar diya.';
     }
     case 'pin_last': {
-      if (!ctx.message.reply_to_message) {
-        throw new Error('Jis message ko pin karna hai usko reply karke bolo, tabhi pin hoga.');
-      }
+      if (!ctx.message.reply_to_message) throw new Error('Jis message ko pin karna hai usko reply karke bolo.');
       await ctx.telegram.pinChatMessage(ctx.chat.id, ctx.message.reply_to_message.message_id);
       return 'Message pin kar diya.';
     }
@@ -571,17 +600,124 @@ async function executeAiAction(ctx, action, params = {}) {
       await ctx.telegram.unpinChatMessage(ctx.chat.id);
       return 'Pinned message unpin kar diya.';
     }
+    case 'kick_user': {
+      const target = requireTarget();
+      await kickUser(ctx, target.id);
+      return `${displayName(target)} ko kick kar diya.`;
+    }
+    case 'ban_user': {
+      const target = requireTarget();
+      await banUser(ctx, target.id);
+      return `${displayName(target)} ko ban kar diya.`;
+    }
+    case 'mute_user': {
+      const target = requireTarget();
+      const minutes = parseInt(params.minutes, 10) > 0 ? parseInt(params.minutes, 10) : 60;
+      await muteUser(ctx, target.id, minutes);
+      return `${displayName(target)} ko ${minutes} min ke liye mute kar diya.`;
+    }
+    case 'unmute_user': {
+      const target = requireTarget();
+      await unmuteUser(ctx, target.id);
+      return `${displayName(target)} ko unmute kar diya.`;
+    }
+    case 'warn_user': {
+      const target = requireTarget();
+      const reason = params.reason || 'No reason given';
+      const count = await addWarn(ctx.chat.id, target, reason);
+      if (count >= BLOCKWORD_WARN_LIMIT) {
+        await kickUser(ctx, target.id);
+        return `${displayName(target)} ko warn kiya (${count}/${BLOCKWORD_WARN_LIMIT}) — limit reach hone se kick bhi kar diya.`;
+      }
+      return `${displayName(target)} ko warn kar diya (${count}/${BLOCKWORD_WARN_LIMIT}).`;
+    }
+    case 'promote_user': {
+      const target = requireTarget();
+      await ctx.telegram.promoteChatMember(ctx.chat.id, target.id, {
+        can_change_info: true,
+        can_delete_messages: true,
+        can_invite_users: true,
+        can_restrict_members: true,
+        can_pin_messages: true,
+        can_promote_members: false,
+        can_manage_video_chats: true,
+      });
+      return `${displayName(target)} ko admin bana diya.`;
+    }
+    case 'demote_user': {
+      const target = requireTarget();
+      await ctx.telegram.promoteChatMember(ctx.chat.id, target.id, {
+        can_change_info: false,
+        can_delete_messages: false,
+        can_invite_users: false,
+        can_restrict_members: false,
+        can_pin_messages: false,
+        can_promote_members: false,
+        can_manage_video_chats: false,
+      });
+      return `${displayName(target)} ko demote kar diya.`;
+    }
+    case 'add_blockword': {
+      const word = (params.word || '').trim().toLowerCase();
+      if (!word) throw new Error('Koi word nahi mila action mein.');
+      const punishment = ['warn', 'mute', 'kick', 'ban'].includes((params.punishment || '').toLowerCase())
+        ? params.punishment.toLowerCase()
+        : 'warn';
+      const { error } = await supabase.from('blockwords').upsert(
+        {
+          chat_id: ctx.chat.id,
+          word,
+          reason: params.reason || 'Not specified',
+          punishment,
+          added_by: ctx.from.id,
+          added_by_name: displayName(ctx.from),
+        },
+        { onConflict: 'chat_id,word' }
+      );
+      if (error) throw new Error(error.message);
+      invalidateBlockwordsCache(ctx.chat.id);
+      return `Blockword "${word}" add kar diya (punishment: ${punishment}).`;
+    }
+    case 'remove_blockword': {
+      const word = (params.word || '').trim().toLowerCase();
+      if (!word) throw new Error('Koi word nahi mila action mein.');
+      const { error } = await supabase.from('blockwords').delete().eq('chat_id', ctx.chat.id).eq('word', word);
+      if (error) throw new Error(error.message);
+      invalidateBlockwordsCache(ctx.chat.id);
+      return `Blockword "${word}" remove kar diya.`;
+    }
     default:
       throw new Error(`Unknown/unsupported action: ${action}`);
   }
 }
 
-async function callOpenRouterAI(userId, userText) {
+// -------------------------------------------------------------------------
+// AI CONVERSATION MEMORY — short per-user rolling history so the persona's
+// "remember the conversation" behavior is actually backed by real context.
+// In-memory only (resets on restart), capped to keep token usage sane.
+// -------------------------------------------------------------------------
+const aiMemory = new Map(); // key: `${chatId}:${userId}` -> [{role, content}, ...]
+const AI_MEMORY_MAX_TURNS = 8; // keeps last 8 user+assistant exchanges (16 messages)
+
+function getAiMemory(chatId, userId) {
+  return aiMemory.get(`${chatId}:${userId}`) || [];
+}
+function pushAiMemory(chatId, userId, userText, assistantText) {
+  const key = `${chatId}:${userId}`;
+  const history = aiMemory.get(key) || [];
+  history.push({ role: 'user', content: userText }, { role: 'assistant', content: assistantText });
+  aiMemory.set(key, history.slice(-AI_MEMORY_MAX_TURNS * 2));
+}
+
+async function callOpenRouterAI(ctx, userText) {
   if (!OPENROUTER_API_KEY) {
     throw new Error('OPENROUTER_API_KEY not configured');
   }
+  const userId = ctx.from.id;
+  const chatId = ctx.chat.id;
   const choice = await getAiPromptChoice(userId);
   const systemPrompt = (AI_PERSONAS[choice] || AI_PERSONAS[1])();
+  const history = getAiMemory(chatId, userId);
 
   const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
     method: 'POST',
@@ -594,6 +730,7 @@ async function callOpenRouterAI(userId, userText) {
       messages: [
         { role: 'system', content: systemPrompt },
         { role: 'system', content: AI_ACTION_SYSTEM },
+        ...history,
         { role: 'user', content: userText },
       ],
       max_tokens: 500,
@@ -774,7 +911,8 @@ bot.use(async (ctx, next) => {
     typeof ctx.message.text === 'string' &&
     ctx.from &&
     !ctx.from.is_bot &&
-    !approvedUsers.has(`${ctx.chat.id}:${ctx.from.id}`)
+    !approvedUsers.has(`${ctx.chat.id}:${ctx.from.id}`) &&
+    !(await isUserAdmin(ctx, ctx.from.id)) // admins are exempt from their own group's blockwords
   ) {
     try {
       const blocked = await findBlockedWord(ctx.chat.id, ctx.message.text);
@@ -943,7 +1081,7 @@ async function sendHelp(ctx) {
         '/ai prompt 1 — default persona',
         '/ai prompt 2 — alternate roast persona',
         '/ai prompt 3 — professional teacher persona',
-        '<i>AI ab group name/description badalna, message pin/unpin karna jaisa limited admin kaam bhi kar sakta hai (Jarvis-style, admins only), auto detects your language, aur "Thinking..." dikha ke sochta hai.</i>',
+        '<i>AI ab Jarvis-style poore admin commands chala sakta hai (kick/ban/mute/warn/promote/demote/pin/blockwords/group name/description — admins only, user-target ke liye unke message ko reply karo), pichli baatein yaad rakhta hai is chat mein, auto detects your language, aur "Thinking..." dikha ke sochta hai.</i>',
       ],
       footer: 'Sab commands group mein use karo, DM mein sirf /ai, /weather, /roll',
     }),
@@ -1226,7 +1364,8 @@ bot.command('blockword', async (ctx) => {
     if (!word) {
       return ctx.reply('⚠️ Usage: /blockword add <word> | <reason> | <punishment: warn/mute/kick/ban>');
     }
-    const finalPunishment = ['warn', 'mute', 'kick', 'ban'].includes(punishment) ? punishment : 'warn';
+    const punishmentLower = (punishment || '').trim().toLowerCase();
+    const finalPunishment = ['warn', 'mute', 'kick', 'ban'].includes(punishmentLower) ? punishmentLower : 'warn';
     const { error } = await supabase.from('blockwords').upsert(
       {
         chat_id: ctx.chat.id,
@@ -1533,7 +1672,7 @@ bot.command('ai', async (ctx) => {
   }
 
   try {
-    const result = await callOpenRouterAI(ctx.from.id, raw);
+    const result = await callOpenRouterAI(ctx, raw);
 
     if (thinkingMsg) {
       try {
@@ -1571,6 +1710,7 @@ bot.command('ai', async (ctx) => {
       }
       try {
         const outcome = await executeAiAction(ctx, result.action, result.params);
+        pushAiMemory(ctx.chat.id, ctx.from.id, raw, `[action: ${result.action}] ${outcome}`);
         return ctx.reply(
           embed({
             emoji: '🤖',
@@ -1590,6 +1730,7 @@ bot.command('ai', async (ctx) => {
     }
 
     // Normal chat reply — already in the user's own language, per the AI action-layer instructions
+    pushAiMemory(ctx.chat.id, ctx.from.id, raw, result.reply || '...');
     await ctx.reply(
       embed({
         emoji: '🤖',
@@ -1700,6 +1841,24 @@ bot.action(/^verify_human:(-?\d+):(\d+)$/, async (ctx) => {
 });
 
 // -------------------------------------------------------------------------
+// KEEP-ALIVE WEB SERVER
+// (Requested as "add web flask" — this project is Node end-to-end, so we
+// use Node's built-in http module instead of mixing in Python/Flask.
+// Serves the same purpose: a health-check endpoint for uptime pings on
+// hosts like Render/Railway/Replit that require the process to bind a port.)
+// -------------------------------------------------------------------------
+const http = require('http');
+const WEB_PORT = process.env.PORT || 3000;
+http
+  .createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('Knowledge Pro bot is alive ✅');
+  })
+  .listen(WEB_PORT, () => {
+    console.log(`🌐 Health-check web server listening on port ${WEB_PORT}`);
+  });
+
+// -------------------------------------------------------------------------
 // LAUNCH
 // -------------------------------------------------------------------------
 bot.catch((err, ctx) => {
@@ -1709,9 +1868,6 @@ bot.catch((err, ctx) => {
 bot.launch().then(() => {
   console.log('✅ Bot is up and running (polling mode)');
 });
-const express = require('express');
-const app = express();
-app.get('/health', (req, res) => res.send('OK'));
-app.listen(process.env.PORT || 3000);
+
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
